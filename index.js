@@ -22,13 +22,13 @@ const openai = new OpenAI({
 
 const aiEnabledChannels = new Set();
 const violationCount = new Map();
-
 const reactions = ["❤️", "👍", "🎮", "💡", "🔥"];
 
 client.once("ready", () => {
     console.log(`✅ Yobest_BYTR Bot is Online: ${client.user.tag}`);
 });
 
+// ====================== GLOBAL MODERATION (Always Active) ======================
 client.on("messageCreate", async (message) => {
     if (message.author.bot || !message.guild) return;
 
@@ -48,61 +48,42 @@ client.on("messageCreate", async (message) => {
                 .setTitle("🤖 Yobest Bot Commands")
                 .setColor(0x00FFAA)
                 .addFields(
-                    { name: "📢 Announcement", value: "`!announce title|desc|yt_id|download|roblox`" },
-                    { name: "🧠 AI System", value: "`!enableai` | `!disableai`" },
+                    { name: "📢 Announcement", value: "`!announce ...`" },
+                    { name: "🧠 AI Chat", value: "`!enableai` | `!disableai`" },
                     { name: "🔨 Moderation", value: "`!ban @user` | `!kick @user` | `!purge 50`" },
                     { name: "👑 Owner", value: "`!scanandclean`" }
                 );
             return message.reply({ embeds: [embed] });
         }
 
-        if (lower.startsWith("!announce ")) {
-            // ... announce code (same as before)
-            const args = content.slice(10).split("|").map(s => s.trim());
-            if (args.length < 5) return message.reply("❌ Usage: `!announce title|description|youtube_id|download_url|roblox_url`");
-            const [title, description, ytId, downloadUrl, robloxUrl] = args;
-            // Embed and buttons code...
-            const embed = new EmbedBuilder()
-                .setTitle(`🚨 ${title}`)
-                .setDescription(description)
-                .setColor(0x00FFAA)
-                .setImage(`https://img.youtube.com/vi/${ytId}/maxresdefault.jpg`)
-                .addFields({ name: "⬇️ Download", value: `[Click Here](${downloadUrl})` }, { name: "🎮 Play Roblox", value: `[Play Now](${robloxUrl})` });
-            const row = new ActionRowBuilder().addComponents(
-                new ButtonBuilder().setLabel("Download").setStyle(ButtonStyle.Link).setURL(downloadUrl),
-                new ButtonBuilder().setLabel("Play Roblox").setStyle(ButtonStyle.Link).setURL(robloxUrl)
-            );
-            await message.channel.send({ content: "@everyone @here 🚨 **New Update by BYTR** 🚨", embeds: [embed], components: [row] });
-            return message.reply("✅ Announcement posted!");
-        }
-
         if (lower === "!enableai") {
             aiEnabledChannels.add(message.channel.id);
-            return message.reply("✅ **AI + Moderation Enabled** in this channel.");
+            return message.reply("✅ **AI Chat Enabled** in this channel (Moderation is always active).");
         }
         if (lower === "!disableai") {
             aiEnabledChannels.delete(message.channel.id);
-            return message.reply("❌ **AI + Moderation Disabled**.");
+            return message.reply("❌ **AI Chat Disabled** in this channel.");
         }
     }
 
-    // AI + Moderation Only in Enabled Channels
+    // === GLOBAL MODERATION (Always On) ===
+    const isBad = await moderateMessage(message);
+    if (isBad) {
+        await message.delete().catch(() => {});
+        await applyTimeout(message);
+        return;
+    }
+
+    // === AI CHAT (Only if enabled in channel) ===
     if (aiEnabledChannels.has(message.channel.id)) {
-        const isBad = await moderateMessage(message);
-        if (isBad) {
-            await message.delete().catch(() => {});
-            await applyTimeout(message);
-            return;
-        }
-
         const isMentioned = message.mentions.has(client.user);
-        const hasTrigger = lower.includes("yobest") || lower.includes("bot") || lower.includes("script") || 
-                          lower.includes("code") || lower.includes("help") || lower.startsWith("hi") || lower.startsWith("hello");
+        const hasTrigger = lower.includes("yobest") || lower.includes("bot") || 
+                          lower.includes("script") || lower.includes("code") || 
+                          lower.includes("help") || lower.startsWith("hi") || lower.startsWith("hello");
 
-        if (isMentioned || hasTrigger || Math.random() < 0.55) {   // Increased chance
+        if (isMentioned || hasTrigger || Math.random() < 0.6) {
             const thinkingMsg = await message.reply("🤔 **Yobest is thinking...**");
 
-            // Single random reaction
             const randomEmoji = reactions[Math.floor(Math.random() * reactions.length)];
             await message.react(randomEmoji).catch(() => {});
 
@@ -127,7 +108,7 @@ async function moderateMessage(message) {
             model: "google/gemini-3.5-flash",
             messages: [{ 
                 role: "user", 
-                content: `Does this message contain swear words, toxicity, spam, NSFW, or bad language? Words like fuck, sex, shit, bitch, etc. Answer ONLY YES or NO.\nMessage: ${message.content}` 
+                content: `Does this message contain bad language, swear words (fuck, sex, shit, bitch, etc.), toxicity, spam or NSFW? Answer ONLY YES or NO.\nMessage: ${message.content.substring(0, 700)}` 
             }],
             max_tokens: 10
         });
@@ -143,9 +124,9 @@ async function applyTimeout(message) {
     try {
         if (count >= 2) {
             await message.member.timeout(10 * 60 * 1000, "Bad language");
-            await message.channel.send(`⛔ ${message.author} has been timed out for 10 minutes.`);
+            await message.channel.send(`⛔ ${message.author} has been timed out for 10 minutes for bad language.`);
         } else {
-            await message.channel.send(`⚠️ ${message.author} No bad language allowed.`);
+            await message.channel.send(`⚠️ ${message.author} No swearing allowed!`);
         }
     } catch (e) {}
 }
@@ -156,13 +137,13 @@ async function getAIResponse(message) {
     const messages = [
         { 
             role: "system", 
-            content: `You are Yobest, expert Roblox Lua scripter.
-Always respond in English.
-**Always** give the complete script in a code block:
+            content: `You are Yobest, expert Roblox Lua developer.
+Always respond in clear English.
+**Always** put the full script in a code block:
 \`\`\`lua
--- Your full code here
+-- Full code here
 \`\`\`
-Never cut the code. Be detailed.` 
+Do not cut the code.` 
         },
         { role: "user", content: userInput }
     ];
@@ -172,20 +153,22 @@ Never cut the code. Be detailed.`
             .filter(a => a.contentType?.startsWith("image/"))
             .map(a => ({ type: "image_url", image_url: { url: a.url } }));
 
-        if (images.length) messages.push({ role: "user", content: [{ type: "text", text: "Analyze image:" }, ...images] });
+        if (images.length) {
+            messages.push({ role: "user", content: [{ type: "text", text: "Analyze this image:" }, ...images] });
+        }
     }
 
     try {
         const completion = await openai.chat.completions.create({
             model: "google/gemini-3.5-flash",
             messages,
-            max_tokens: 1300,
+            max_tokens: 1400,
             temperature: 0.7
         });
         return completion.choices[0].message.content;
     } catch (err) {
         console.error(err);
-        return "I'm here! What script do you need?";
+        return "I'm here to help with Roblox scripts! What do you need?";
     }
 }
 
@@ -200,7 +183,7 @@ async function scanAndCleanChannel(message) {
                 deleted++;
             }
         }
-        await message.channel.send(`✅ Scan complete. Deleted **${deleted}** bad messages.`);
+        await message.channel.send(`✅ Deleted **${deleted}** bad messages.`);
     } catch (e) {
         await message.channel.send("❌ Scan error.");
     }
