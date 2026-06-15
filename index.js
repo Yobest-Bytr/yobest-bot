@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, PermissionFlagsBits, ChannelType } = require("discord.js");
+const { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, PermissionFlagsBits } = require("discord.js");
 const OpenAI = require("openai");
 
 const client = new Client({
@@ -23,6 +23,8 @@ const openai = new OpenAI({
 const aiEnabledChannels = new Set();
 const violationCount = new Map();
 
+const reactions = ["❤️", "👍", "🎮", "💡", "🔥"];
+
 client.once("ready", () => {
     console.log(`✅ Yobest_BYTR Bot is Online: ${client.user.tag}`);
 });
@@ -35,7 +37,7 @@ client.on("messageCreate", async (message) => {
     const isAdmin = message.member?.permissions.has(PermissionFlagsBits.Administrator);
     const isOwner = message.guild.ownerId === message.author.id;
 
-    // ====================== COMMANDS ======================
+    // Commands
     if (isOwner && lower === "!scanandclean") {
         return await scanAndCleanChannel(message);
     }
@@ -55,47 +57,37 @@ client.on("messageCreate", async (message) => {
         }
 
         if (lower.startsWith("!announce ")) {
+            // ... announce code (same as before)
             const args = content.slice(10).split("|").map(s => s.trim());
             if (args.length < 5) return message.reply("❌ Usage: `!announce title|description|youtube_id|download_url|roblox_url`");
-            
             const [title, description, ytId, downloadUrl, robloxUrl] = args;
+            // Embed and buttons code...
             const embed = new EmbedBuilder()
                 .setTitle(`🚨 ${title}`)
                 .setDescription(description)
                 .setColor(0x00FFAA)
                 .setImage(`https://img.youtube.com/vi/${ytId}/maxresdefault.jpg`)
-                .addFields(
-                    { name: "⬇️ Download", value: `[Click Here](${downloadUrl})` },
-                    { name: "🎮 Play Roblox", value: `[Play Now](${robloxUrl})` }
-                )
-                .setTimestamp();
-
+                .addFields({ name: "⬇️ Download", value: `[Click Here](${downloadUrl})` }, { name: "🎮 Play Roblox", value: `[Play Now](${robloxUrl})` });
             const row = new ActionRowBuilder().addComponents(
-                new ButtonBuilder().setLabel("Download").setStyle(ButtonStyle.Link).setURL(downloadUrl).setEmoji("📥"),
-                new ButtonBuilder().setLabel("Play Roblox").setStyle(ButtonStyle.Link).setURL(robloxUrl).setEmoji("🎮")
+                new ButtonBuilder().setLabel("Download").setStyle(ButtonStyle.Link).setURL(downloadUrl),
+                new ButtonBuilder().setLabel("Play Roblox").setStyle(ButtonStyle.Link).setURL(robloxUrl)
             );
-
-            await message.channel.send({ 
-                content: "@everyone @here 🚨 **New Update by BYTR** 🚨", 
-                embeds: [embed], 
-                components: [row] 
-            });
+            await message.channel.send({ content: "@everyone @here 🚨 **New Update by BYTR** 🚨", embeds: [embed], components: [row] });
             return message.reply("✅ Announcement posted!");
         }
 
         if (lower === "!enableai") {
             aiEnabledChannels.add(message.channel.id);
-            return message.reply("✅ **AI System Enabled** in this channel. Moderation is now active.");
+            return message.reply("✅ **AI + Moderation Enabled** in this channel.");
         }
         if (lower === "!disableai") {
             aiEnabledChannels.delete(message.channel.id);
-            return message.reply("❌ **AI System Disabled** in this channel.");
+            return message.reply("❌ **AI + Moderation Disabled**.");
         }
     }
 
-    // ====================== AI + MODERATION (Only in Enabled Channels) ======================
+    // AI + Moderation Only in Enabled Channels
     if (aiEnabledChannels.has(message.channel.id)) {
-        // Moderation
         const isBad = await moderateMessage(message);
         if (isBad) {
             await message.delete().catch(() => {});
@@ -103,32 +95,25 @@ client.on("messageCreate", async (message) => {
             return;
         }
 
-        // AI Response Trigger
         const isMentioned = message.mentions.has(client.user);
-        const hasTrigger = lower.includes("yobest") || lower.includes("bot") || 
-                          lower.includes("script") || lower.includes("code") || 
-                          lower.includes("help") || lower.startsWith("hello");
+        const hasTrigger = lower.includes("yobest") || lower.includes("bot") || lower.includes("script") || 
+                          lower.includes("code") || lower.includes("help") || lower.startsWith("hi") || lower.startsWith("hello");
 
-        if (isMentioned || hasTrigger || Math.random() < 0.4) {
+        if (isMentioned || hasTrigger || Math.random() < 0.55) {   // Increased chance
             const thinkingMsg = await message.reply("🤔 **Yobest is thinking...**");
 
-            await message.react("❤️").catch(() => {});
-            await message.react("👍").catch(() => {});
-            await message.react("🎮").catch(() => {});
+            // Single random reaction
+            const randomEmoji = reactions[Math.floor(Math.random() * reactions.length)];
+            await message.react(randomEmoji).catch(() => {});
 
             const response = await getAIResponse(message);
-            
             await thinkingMsg.delete().catch(() => {});
 
             if (response) {
                 const reply = await message.reply(response);
-                
                 if (lower.includes("script") || lower.includes("code")) {
                     try {
-                        await reply.startThread({
-                            name: `Roblox Help - ${message.author.username}`,
-                            autoArchiveDuration: 1440,
-                        });
+                        await reply.startThread({ name: `Script Help - ${message.author.username}`, autoArchiveDuration: 1440 });
                     } catch (e) {}
                 }
             }
@@ -140,7 +125,10 @@ async function moderateMessage(message) {
     try {
         const res = await openai.chat.completions.create({
             model: "google/gemini-3.5-flash",
-            messages: [{ role: "user", content: `Is this message toxic, spam, scam, NSFW, or rule-breaking? Answer ONLY YES or NO.\nMessage: ${message.content.substring(0, 600)}` }],
+            messages: [{ 
+                role: "user", 
+                content: `Does this message contain swear words, toxicity, spam, NSFW, or bad language? Words like fuck, sex, shit, bitch, etc. Answer ONLY YES or NO.\nMessage: ${message.content}` 
+            }],
             max_tokens: 10
         });
         return res.choices[0].message.content.toUpperCase().trim().includes("YES");
@@ -154,10 +142,10 @@ async function applyTimeout(message) {
 
     try {
         if (count >= 2) {
-            await message.member.timeout(10 * 60 * 1000, "Repeated violations");
+            await message.member.timeout(10 * 60 * 1000, "Bad language");
             await message.channel.send(`⛔ ${message.author} has been timed out for 10 minutes.`);
         } else {
-            await message.channel.send(`⚠️ ${message.author} Please follow the rules.`);
+            await message.channel.send(`⚠️ ${message.author} No bad language allowed.`);
         }
     } catch (e) {}
 }
@@ -168,13 +156,13 @@ async function getAIResponse(message) {
     const messages = [
         { 
             role: "system", 
-            content: `You are Yobest, an expert Roblox Lua scripter.
-Always respond in clear English.
-**Always** provide the full script inside a proper code block:
+            content: `You are Yobest, expert Roblox Lua scripter.
+Always respond in English.
+**Always** give the complete script in a code block:
 \`\`\`lua
--- Full script here
+-- Your full code here
 \`\`\`
-Never cut off the code. Be detailed and professional.` 
+Never cut the code. Be detailed.` 
         },
         { role: "user", content: userInput }
     ];
@@ -184,25 +172,20 @@ Never cut off the code. Be detailed and professional.`
             .filter(a => a.contentType?.startsWith("image/"))
             .map(a => ({ type: "image_url", image_url: { url: a.url } }));
 
-        if (images.length) {
-            messages.push({ 
-                role: "user", 
-                content: [{ type: "text", text: "Analyze this image and provide the Roblox script:" }, ...images] 
-            });
-        }
+        if (images.length) messages.push({ role: "user", content: [{ type: "text", text: "Analyze image:" }, ...images] });
     }
 
     try {
         const completion = await openai.chat.completions.create({
             model: "google/gemini-3.5-flash",
             messages,
-            max_tokens: 1200,
-            temperature: 0.65
+            max_tokens: 1300,
+            temperature: 0.7
         });
         return completion.choices[0].message.content;
     } catch (err) {
         console.error(err);
-        return "I'm ready to help! Please tell me what script you need.";
+        return "I'm here! What script do you need?";
     }
 }
 
@@ -217,7 +200,7 @@ async function scanAndCleanChannel(message) {
                 deleted++;
             }
         }
-        await message.channel.send(`✅ Deleted **${deleted}** bad messages.`);
+        await message.channel.send(`✅ Scan complete. Deleted **${deleted}** bad messages.`);
     } catch (e) {
         await message.channel.send("❌ Scan error.");
     }
