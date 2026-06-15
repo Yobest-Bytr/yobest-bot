@@ -4,12 +4,14 @@
  * FEATURES OVERVIEW
  * --------------------------------------------------------
  *  - Global smart moderation (ALWAYS ON):
- *      -> Bad words filter
- *      -> AI-based detection of toxicity, scams, phishing,
- *         "free robux" / "free items" scam links, suspicious
- *         Discord invite spam, etc.
+ *      -> Bad words filter (text)
+ *      -> AI text classification: toxic / scam / phishing
+ *      -> AI IMAGE classification: scans attached/embedded
+ *         images for fake giveaways, crypto scams, phishing
+ *         screenshots (e.g. fake "MrBeast giveaway" posts)
  *      -> Deletes flagged messages + warn/timeout system
- *      -> Logs every action to a mod-log channel
+ *      -> Logs every action to a mod-log channel with the
+ *         original image attached as proof
  *
  *  - !enableai / !disableai
  *      -> Toggles ONLY the AI chat-response feature
@@ -25,10 +27,12 @@
  *      -> AI also uses this info automatically when asked
  *
  *  - !help / !announce (admin)
- *  - !scanandclean (owner)
- *  - New utility & fun: !ping, !stats, !serverinfo, !userinfo,
+ *  - !scanandclean (owner) -- now also scans image attachments
+ *  - Utility & fun: !ping, !stats, !serverinfo, !userinfo,
  *    !avatar, !roll, !8ball, !suggest
- *  - Welcome system on member join
+ *  - Upgraded welcome system: banner-style embed, member count,
+ *    site link, and a "rules/intro" button
+ *  - NEW: !setwelcome (admin) to customize the welcome message
  * ========================================================
  */
 
@@ -39,7 +43,8 @@ const {
     ActionRowBuilder,
     ButtonBuilder,
     ButtonStyle,
-    PermissionFlagsBits
+    PermissionFlagsBits,
+    AttachmentBuilder
 } = require("discord.js");
 const OpenAI = require("openai");
 
@@ -68,11 +73,15 @@ const startTime = Date.now();        // for uptime in !stats
 const WELCOME_CHANNEL_ID = process.env.WELCOME_CHANNEL_ID || null;
 const MODLOG_CHANNEL_ID = process.env.MODLOG_CHANNEL_ID || null;
 
+// Customizable welcome message (editable live via !setwelcome)
+// Use {user}, {server}, {count} as placeholders
+let welcomeMessage =
+    "Hey {user}, welcome aboard **{server}**! 🎉\n" +
+    "You're member **#{count}** of our growing community.";
+
 // ====================== SITE KNOWLEDGE ======================
 // Edit this block whenever your site changes. The AI uses this
 // as context so it can answer questions about Yobest Studio.
-// (No public API was available on the site, so this is kept
-// up to date manually — update links/highlights as needed.)
 const SITE_INFO = {
     name: "Yobest Studio",
     url: "https://yobest-bytr.vercel.app/",
@@ -80,11 +89,9 @@ const SITE_INFO = {
         "Yobest Studio is a hub for Roblox games, AI tools, and a creator community. " +
         "It showcases Roblox game projects made by the Yobest/BYTR team, lets players " +
         "find links to play those games, and connects players with the community and updates.",
-    // Add/edit links below as your site grows
     links: {
         "Website": "https://yobest-bytr.vercel.app/",
     },
-    // Add short blurbs about specific games/sections here as needed
     highlights: [
         "Browse Roblox games made by the Yobest/BYTR team",
         "Find download/play links for the latest releases",
@@ -97,7 +104,7 @@ client.once("ready", () => {
     console.log(`✅ Yobest_BYTR Bot is Online! Logged in as ${client.user.tag}`);
 });
 
-// ====================== WELCOME SYSTEM ======================
+// ====================== WELCOME SYSTEM (UPGRADED) ======================
 client.on("guildMemberAdd", async (member) => {
     try {
         const channel = WELCOME_CHANNEL_ID
@@ -106,18 +113,30 @@ client.on("guildMemberAdd", async (member) => {
 
         if (!channel) return;
 
+        const description = welcomeMessage
+            .replace(/{user}/g, `${member}`)
+            .replace(/{server}/g, member.guild.name)
+            .replace(/{count}/g, `${member.guild.memberCount}`);
+
         const embed = new EmbedBuilder()
-            .setTitle("👋 Welcome!")
-            .setDescription(
-                `Hey ${member}, welcome to **${member.guild.name}**!\n` +
-                `We now have **${member.guild.memberCount}** members.\n\n` +
-                `🔗 Check out our site: ${SITE_INFO.url}`
-            )
             .setColor(0x00FFAA)
-            .setThumbnail(member.user.displayAvatarURL({ dynamic: true }))
+            .setAuthor({
+                name: `Welcome to ${member.guild.name}!`,
+                iconURL: member.guild.iconURL({ dynamic: true }) || undefined
+            })
+            .setTitle(`👋 ${member.user.username} just joined!`)
+            .setDescription(`${description}\n\n🔗 Explore our site: [${SITE_INFO.name}](${SITE_INFO.url})`)
+            .setThumbnail(member.user.displayAvatarURL({ dynamic: true, size: 256 }))
+            // Large banner-style image at the bottom of the embed for visual impact
+            .setImage("https://raw.githubusercontent.com/Yobest-Bytr/yobest-studio/refs/heads/main/bytrhhh.png")
+            .setFooter({ text: `Member #${member.guild.memberCount} • ${SITE_INFO.name}` })
             .setTimestamp();
 
-        await channel.send({ embeds: [embed] });
+        const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setLabel("Visit Yobest Studio").setStyle(ButtonStyle.Link).setURL(SITE_INFO.url).setEmoji("🌐")
+        );
+
+        await channel.send({ content: `${member}`, embeds: [embed], components: [row] });
     } catch (e) {
         console.error("Welcome message error:", e);
     }
@@ -146,11 +165,12 @@ client.on("messageCreate", async (message) => {
                 .addFields(
                     { name: "📢 Announcement", value: "`!announce title|desc|yt_id|download|roblox`\nPosts an update announcement with download/play buttons." },
                     { name: "🧠 AI Chat", value: "`!enableai` — enable AI chat replies in this channel\n`!disableai` — disable AI chat replies\n(Moderation stays active regardless)" },
-                    { name: "🔨 Moderation", value: "`!ban @user` | `!kick @user` | `!purge 50`\nGlobal smart auto-moderation is always active (bad words, toxicity, scams, phishing links)." },
+                    { name: "🔨 Moderation", value: "`!ban @user` | `!kick @user` | `!purge 50`\nGlobal smart auto-moderation is always active — checks text AND images for bad words, toxicity, scams, and phishing." },
+                    { name: "👋 Welcome", value: "`!setwelcome <message>` — customize the welcome text\nPlaceholders: `{user}` `{server}` `{count}`" },
                     { name: "🌐 Site", value: "`!site` — info & links for Yobest Studio" },
                     { name: "✨ Utility", value: "`!ping` — bot latency\n`!stats` — server & bot stats\n`!serverinfo` — server details\n`!userinfo [@user]` — user details\n`!avatar [@user]` — show avatar" },
                     { name: "🎉 Fun", value: "`!roll [NdN]` — roll dice (e.g. `!roll 2d6`)\n`!8ball <question>` — magic 8-ball\n`!suggest <text>` — submit a suggestion" },
-                    { name: "👑 Owner", value: "`!scanandclean` — scan & delete bad messages from the last 100" }
+                    { name: "👑 Owner", value: "`!scanandclean` — scan & delete bad messages (text + images) from the last 100" }
                 )
                 .setFooter({ text: "Yobest_BYTR Bot" })
                 .setTimestamp();
@@ -201,13 +221,30 @@ client.on("messageCreate", async (message) => {
             aiEnabledChannels.delete(message.channel.id);
             return message.reply("❌ AI Chat Replies Disabled in this channel.\n(🛡️ Moderation remains active.)");
         }
+
+        // ---- !setwelcome ----
+        if (lower === "!setwelcome" || lower.startsWith("!setwelcome ")) {
+            const newMessage = content.split(" ").slice(1).join(" ");
+            if (!newMessage) {
+                return message.reply(
+                    "❌ Usage: `!setwelcome <message>`\n" +
+                    "Placeholders: `{user}` (mentions the new member), `{server}` (server name), `{count}` (member count)\n\n" +
+                    `Current message:\n\`\`\`${welcomeMessage}\`\`\``
+                );
+            }
+            welcomeMessage = newMessage;
+            return message.reply(`✅ Welcome message updated! Preview:\n\n${newMessage
+                .replace(/{user}/g, `${message.author}`)
+                .replace(/{server}/g, message.guild.name)
+                .replace(/{count}/g, `${message.guild.memberCount}`)}`);
+        }
     }
 
     // ====================== GLOBAL SMART MODERATION (ALWAYS ACTIVE) ======================
     const modResult = await moderateMessage(message);
     if (modResult.flagged) {
         await message.delete().catch(() => {});
-        await applyTimeout(message, modResult.reason, modResult.category);
+        await applyTimeout(message, modResult.reason, modResult.category, modResult.evidenceUrl);
         return;
     }
 
@@ -234,7 +271,7 @@ client.on("messageCreate", async (message) => {
                 { name: "⏱️ Bot Uptime", value: uptimeStr, inline: true },
                 { name: "🌐 Servers Connected", value: `${client.guilds.cache.size}`, inline: true },
                 { name: "🧠 AI Chat Status", value: aiEnabledChannels.has(message.channel.id) ? "Enabled here" : "Disabled here", inline: true },
-                { name: "🛡️ Moderation", value: "Always Active (smart AI + filters)", inline: true }
+                { name: "🛡️ Moderation", value: "Always Active (text + image AI scan)", inline: true }
             )
             .setTimestamp();
 
@@ -382,31 +419,51 @@ client.on("messageCreate", async (message) => {
 // ====================== SMART MODERATION ======================
 
 /**
+ * Returns the first image URL attached to or embedded in a message,
+ * or null if there isn't one. Covers direct attachments AND
+ * image embeds (e.g. pasted links that Discord auto-embeds).
+ */
+function getImageUrl(message) {
+    const attachment = message.attachments.find(a =>
+        a.contentType?.startsWith("image/") ||
+        /\.(png|jpe?g|gif|webp)$/i.test(a.url)
+    );
+    if (attachment) return attachment.url;
+
+    const embedImage = message.embeds.find(e => e.image || e.thumbnail);
+    if (embedImage) return (embedImage.image || embedImage.thumbnail).url;
+
+    return null;
+}
+
+/**
  * Checks a message for:
- *  - Bad/profane words (fast regex check)
- *  - AI-based detection of toxicity, scams, phishing, and
- *    suspicious "free Robux/items" or fake-giveaway links
+ *  - Bad/profane words (fast regex check on text)
+ *  - AI text classification: toxic / scam / phishing
+ *  - AI IMAGE classification: scans any attached/embedded image
+ *    for scam/phishing screenshots (fake giveaways, crypto scams,
+ *    impersonation posts, etc.)
  *
- * Returns: { flagged: bool, reason: string, category: string }
+ * Returns: { flagged: bool, reason: string, category: string, evidenceUrl: string|null }
  */
 async function moderateMessage(message) {
     const text = message.content;
+    const imageUrl = getImageUrl(message);
 
     // ---- Fast regex: profanity ----
     const badWords = /fuck|sex|shit|bitch|asshole|cunt|fucker|damn|bastard/i;
     if (badWords.test(text)) {
-        return { flagged: true, reason: "Inappropriate language", category: "language" };
+        return { flagged: true, reason: "Inappropriate language", category: "language", evidenceUrl: imageUrl };
     }
 
-    if (!text.trim()) return { flagged: false };
-
-    // ---- AI check: toxicity + scams + phishing ----
-    try {
-        const res = await openai.chat.completions.create({
-            model: "google/gemini-3.5-flash",
-            messages: [{
-                role: "user",
-                content:
+    // ---- AI check: text content ----
+    if (text.trim()) {
+        try {
+            const res = await openai.chat.completions.create({
+                model: "google/gemini-3.5-flash",
+                messages: [{
+                    role: "user",
+                    content:
 `Classify this Discord message into exactly ONE category. Reply with ONLY the category word, nothing else.
 
 Categories:
@@ -416,32 +473,77 @@ Categories:
 - SAFE (normal message, no issues)
 
 Message: "${text}"`
-            }],
-            max_tokens: 5
-        });
+                }],
+                max_tokens: 5
+            });
 
-        const category = (res.choices[0].message.content || "").toUpperCase().trim();
+            const category = (res.choices[0].message.content || "").toUpperCase().trim();
 
-        if (category.includes("TOXIC")) {
-            return { flagged: true, reason: "Toxic / harassing message", category: "toxic" };
+            if (category.includes("TOXIC")) {
+                return { flagged: true, reason: "Toxic / harassing message", category: "toxic", evidenceUrl: imageUrl };
+            }
+            if (category.includes("SCAM")) {
+                return { flagged: true, reason: "Scam content (fake giveaway / free items link)", category: "scam", evidenceUrl: imageUrl };
+            }
+            if (category.includes("PHISH")) {
+                return { flagged: true, reason: "Phishing link / fake account warning", category: "phishing", evidenceUrl: imageUrl };
+            }
+        } catch {
+            // fail safe: continue to image check even if text check fails
         }
-        if (category.includes("SCAM")) {
-            return { flagged: true, reason: "Scam content (fake giveaway / free items link)", category: "scam" };
-        }
-        if (category.includes("PHISH")) {
-            return { flagged: true, reason: "Phishing link / fake account warning", category: "phishing" };
-        }
-        return { flagged: false };
-    } catch {
-        return { flagged: false }; // fail safe: don't block messages if AI check fails
     }
+
+    // ---- AI check: image content (vision) ----
+    if (imageUrl) {
+        try {
+            const res = await openai.chat.completions.create({
+                model: "google/gemini-3.5-flash",
+                messages: [{
+                    role: "user",
+                    content: [
+                        {
+                            type: "text",
+                            text:
+`Look at this image. It was posted in a Discord server. Classify it into exactly ONE category. Reply with ONLY the category word, nothing else.
+
+Categories:
+- SCAM (screenshots of fake giveaways, fake celebrity/influencer crypto or Robux giveaways, fake "you've won" messages, fake withdrawal/payment success screens used to bait people, impersonated social media posts promoting crypto/casino sites)
+- PHISHING (fake login pages, fake account-verification or "your account will be banned" screenshots, fake Discord/Roblox/Steam security warnings)
+- NSFW (sexual, violent, or graphic content)
+- SAFE (normal image, no issues — memes, screenshots of games, art, photos, etc.)
+
+Image:`
+                        },
+                        { type: "image_url", image_url: { url: imageUrl } }
+                    ]
+                }],
+                max_tokens: 5
+            });
+
+            const category = (res.choices[0].message.content || "").toUpperCase().trim();
+
+            if (category.includes("SCAM")) {
+                return { flagged: true, reason: "Image is a fake giveaway / crypto scam screenshot", category: "scam", evidenceUrl: imageUrl };
+            }
+            if (category.includes("PHISH")) {
+                return { flagged: true, reason: "Image is a phishing / fake security warning", category: "phishing", evidenceUrl: imageUrl };
+            }
+            if (category.includes("NSFW")) {
+                return { flagged: true, reason: "Image contains NSFW/graphic content", category: "nsfw", evidenceUrl: imageUrl };
+            }
+        } catch {
+            // fail safe: don't block if vision check fails
+        }
+    }
+
+    return { flagged: false };
 }
 
 /**
  * Applies a warning, then a 10-minute timeout on repeat offenses.
  * Also logs the action to the mod-log channel (if configured).
  */
-async function applyTimeout(message, reason, category) {
+async function applyTimeout(message, reason, category, evidenceUrl) {
     const userId = message.author.id;
     const count = (violationCount.get(userId) || 0) + 1;
     violationCount.set(userId, count);
@@ -456,13 +558,14 @@ async function applyTimeout(message, reason, category) {
         message.channel.send(`⚠️ ${message.author}, your message was removed. Reason: **${reason}**`).catch(() => {});
     }
 
-    await logToModChannel(message, reason, category, actionTaken, count);
+    await logToModChannel(message, reason, category, actionTaken, count, evidenceUrl);
 }
 
 /**
  * Sends a detailed log entry to the mod-log channel, if configured.
+ * Includes the flagged image (if any) as evidence.
  */
-async function logToModChannel(message, reason, category, actionTaken, count) {
+async function logToModChannel(message, reason, category, actionTaken, count, evidenceUrl) {
     if (!MODLOG_CHANNEL_ID) return;
 
     try {
@@ -473,7 +576,8 @@ async function logToModChannel(message, reason, category, actionTaken, count) {
             language: "🤬",
             toxic: "☢️",
             scam: "🎭",
-            phishing: "🎣"
+            phishing: "🎣",
+            nsfw: "🔞"
         };
 
         const embed = new EmbedBuilder()
@@ -489,6 +593,8 @@ async function logToModChannel(message, reason, category, actionTaken, count) {
                 { name: "Original Content", value: message.content.slice(0, 1000) || "*(empty/embed/attachment)*" }
             )
             .setTimestamp();
+
+        if (evidenceUrl) embed.setImage(evidenceUrl);
 
         await logChannel.send({ embeds: [embed] });
     } catch (e) {
@@ -688,7 +794,7 @@ function formatUptime(ms) {
 // ====================== OWNER: SCAN & CLEAN ======================
 
 async function scanAndCleanChannel(message) {
-    await message.reply("🔍 Scanning last 100 messages...");
+    await message.reply("🔍 Scanning last 100 messages (text + images)...");
     try {
         const msgs = await message.channel.messages.fetch({ limit: 100 });
         let deleted = 0;
