@@ -6,7 +6,8 @@ const client = new Client({
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent,
-        GatewayIntentBits.GuildMessageReactions
+        GatewayIntentBits.GuildMessageReactions,
+        GatewayIntentBits.GuildModeration
     ]
 });
 
@@ -28,83 +29,142 @@ client.once("ready", () => {
 client.on("messageCreate", async (message) => {
     if (message.author.bot || !message.guild) return;
 
-    const content = message.content.toLowerCase().trim();
+    const content = message.content.trim();
+    const lower = content.toLowerCase();
 
-    if (content === "!help") {
-        return message.reply("**Yobest Bot Commands:**\n`!announce title|desc|yt_id|dl|rb`\n`!enableai` | `!disableai`");
-    }
-
+    // ====================== ADMIN COMMANDS ======================
     if (message.member?.permissions.has(PermissionFlagsBits.Administrator)) {
-        if (content.startsWith("!announce ")) {
-            const args = message.content.slice(10).split("|").map(s => s.trim());
-            if (args.length < 5) return message.reply("❌ Usage: `!announce title|description|youtube_id|download_url|roblox_url`");
+        if (lower === "!help") {
+            const embed = new EmbedBuilder()
+                .setTitle("🤖 Yobest Bot - لوحة التحكم")
+                .setColor(0x00FFAA)
+                .addFields(
+                    { name: "🎮 أوامر الإعلان", value: "`!announce title|desc|yt|dl|rb`" },
+                    { name: "🧠 الذكاء الاصطناعي", value: "`!enableai` | `!disableai`" },
+                    { name: "🔨 إدارية", value: "`!ban @user` | `!kick @user` | `!purge 50`" },
+                    { name: "📜 أوامر أخرى", value: "`!warn @user` | `!say [text]`" }
+                );
+            return message.reply({ embeds: [embed] });
+        }
 
-            const [title, description, ytId, dlUrl, rbUrl] = args;
-
+        if (lower.startsWith("!announce ")) {
+            // ... (نفس الكود السابق مع تحسينات)
+            const args = content.slice(10).split("|").map(s => s.trim());
+            if (args.length < 5) return message.reply("❌ الاستخدام: `!announce العنوان|الوصف|ايدي اليوتيوب|رابط التحميل|رابط روبلوكس`");
+            
+            const [title, desc, ytId, dlUrl, rbUrl] = args;
+            // Embed + Buttons (كود الإعلان السابق)
             const embed = new EmbedBuilder()
                 .setTitle(`🚨 ${title}`)
-                .setDescription(description)
+                .setDescription(desc)
                 .setColor(0x00FFAA)
                 .setImage(`https://img.youtube.com/vi/${ytId}/maxresdefault.jpg`)
                 .addFields(
-                    { name: "⬇️ Download", value: `[Click Here](${dlUrl})` },
-                    { name: "🎮 Play Roblox", value: `[Play Now](${rbUrl})` }
-                )
-                .setTimestamp();
+                    { name: "⬇️ Download", value: `[اضغط هنا](${dlUrl})` },
+                    { name: "🎮 Play", value: `[Play in Roblox](${rbUrl})` }
+                );
 
             const row = new ActionRowBuilder().addComponents(
                 new ButtonBuilder().setLabel("Download Now").setStyle(ButtonStyle.Link).setURL(dlUrl).setEmoji("📥"),
-                new ButtonBuilder().setLabel("Play in Roblox").setStyle(ButtonStyle.Link).setURL(rbUrl).setEmoji("🎮")
+                new ButtonBuilder().setLabel("Play Roblox").setStyle(ButtonStyle.Link).setURL(rbUrl).setEmoji("🎮")
             );
 
             await message.channel.send({ 
-                content: "@everyone @here 🚨 **Roblox Studio by BYTR** 🚨\n<:BYT1:1205615882211033138><:BYT1:1205615882211033138><:BYT1:1205615882211033138>", 
+                content: "@everyone @here <:BYT1:1205615882211033138> **BYTR NEW UPDATE** <:BYT1:1205615882211033138>",
                 embeds: [embed], 
                 components: [row] 
             });
-
-            return message.reply("✅ Announcement posted!");
+            return message.reply("✅ تم نشر الإعلان بنجاح!");
         }
 
-        if (content === "!enableai") {
-            aiEnabledChannels.add(message.channel.id);
-            return message.reply("✅ AI (Yobest) enabled in this channel.");
+        // Ban / Kick / Purge
+        if (lower.startsWith("!ban ")) {
+            const user = message.mentions.users.first();
+            if (!user) return message.reply("❌ Mention user to ban.");
+            message.guild.members.ban(user, { reason: "Banned by Yobest Bot" });
+            return message.reply(`✅ تم تبنيد ${user.tag}`);
         }
-        if (content === "!disableai") {
-            aiEnabledChannels.delete(message.channel.id);
-            return message.reply("✅ AI disabled.");
+
+        if (lower.startsWith("!kick ")) {
+            const user = message.mentions.users.first();
+            if (!user) return message.reply("❌ Mention user to kick.");
+            message.guild.members.kick(user);
+            return message.reply(`✅ تم طرد ${user.tag}`);
+        }
+
+        if (lower.startsWith("!purge ")) {
+            const amount = parseInt(lower.split(" ")[1]) || 20;
+            await message.channel.bulkDelete(amount, true);
+            return message.reply(`🧹 تم حذف ${amount} رسالة.`).then(m => setTimeout(() => m.delete(), 3000));
         }
     }
 
-    // AI Mode
+    // ====================== AI MODE ======================
     if (aiEnabledChannels.has(message.channel.id)) {
-        if (Math.random() < 0.4 || message.mentions.has(client.user)) {
-            try {
-                const response = await getAIResponse(message);
-                if (response) await message.reply(response);
-            } catch (e) {}
+        // Moderation
+        const isBad = await moderateMessage(message);
+        if (isBad) {
+            await message.delete().catch(() => {});
+            return message.channel.send("⚠️ رسالة مخالفة تم حذفها بواسطة Yobest AI");
+        }
+
+        if (message.mentions.has(client.user) || lower.includes("yobest") || Math.random() < 0.35) {
+            const response = await getAIResponse(message);
+            if (response) await message.reply(response);
         }
     }
 });
 
-async function getAIResponse(message) {
-    const messages = [{
-        role: "system",
-        content: "You are Yobest, a helpful and enthusiastic Roblox developer assistant. Focus on Roblox Studio, scripting, uncopylocked games. Be friendly and concise."
-    }];
+async function moderateMessage(message) {
+    try {
+        const res = await openai.chat.completions.create({
+            model: "google/gemini-3.5-flash",
+            messages: [{ role: "user", content: `هل هذه الرسالة تحتوي على سب، إزعاج، احتيال، إباحية أو إعلان غير مرغوب؟ رد بـ YES أو NO فقط.\nالرسالة: ${message.content}` }],
+            max_tokens: 10
+        });
+        return res.choices[0].message.content.toUpperCase().includes("YES");
+    } catch { return false; }
+}
 
-    let userContent = message.content.replace(`<@${client.user.id}>`, "").trim();
-    messages.push({ role: "user", content: userContent });
+async function getAIResponse(message) {
+    const userMsg = message.content.replace(`<@${client.user.id}>`, "").trim() || "مرحبا";
+
+    const systemPrompt = `أنت Yobest - مساعد روبلوكس ذكي وودود. 
+    متخصص في كتابة سكربتات Lua نظيفة وقوية.
+    استخدم \`\`\`lua\nكود هنا\n\`\`\` لعرض السكربتات.
+    كن مفيداً، متحمساً، وموجزاً.`;
+
+    const messages = [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userMsg }
+    ];
+
+    // دعم الصور
+    if (message.attachments.size > 0) {
+        messages.push({
+            role: "user",
+            content: [
+                { type: "text", text: "تحليل هذه الصورة ومساعدتي في روبلوكس:" },
+                ...Array.from(message.attachments.values()).map(att => ({
+                    type: "image_url", image_url: { url: att.url }
+                }))
+            ]
+        });
+    }
 
     try {
         const completion = await openai.chat.completions.create({
             model: "google/gemini-3.5-flash",
             messages,
-            max_tokens: 300,
+            max_tokens: 600,
+            temperature: 0.7
         });
-        return completion.choices[0].message.content;
+
+        let reply = completion.choices[0].message.content;
+        return reply;
     } catch (err) {
-        return "I'm here! Ask me anything about Roblox development.";
+        console.error(err);
+        return "🛠️ مشغول حالياً... جرب مرة أخرى!";
     }
 }
 
