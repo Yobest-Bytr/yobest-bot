@@ -6,33 +6,42 @@
  *  - Global smart moderation (ALWAYS ON):
  *      -> Bad words filter (text)
  *      -> AI text classification: toxic / scam / phishing
- *      -> AI IMAGE classification: scans attached/embedded
- *         images for fake giveaways, crypto scams, phishing
- *         screenshots (e.g. fake "MrBeast giveaway" posts)
+ *      -> AI IMAGE classification on ALL image attachments
+ *         AND link-preview embeds (with retry, since Discord
+ *         sometimes adds the embed a moment after the message)
+ *      -> Non-image file attachments (pdf, txt, html, etc.)
+ *         are flagged for admin review (can't be "AI-read"
+ *         reliably, but suspicious filenames/types are blocked)
  *      -> Deletes flagged messages + warn/timeout system
  *      -> Logs every action to a mod-log channel with the
  *         original image attached as proof
  *
  *  - !enableai / !disableai
  *      -> Toggles ONLY the AI chat-response feature
- *      -> Moderation is unaffected
  *
- *  - AI Roblox Lua script generation
- *      -> Always returns FULL, uncut ```lua code blocks
- *      -> Auto-continues if a script gets cut off
- *      -> Sent as a clean embed intro + code block(s)
+ *  - AI Roblox Lua script generation (full, uncut ```lua blocks)
+ *
+ *  - !announce -- COMPLETELY REWORKED, much easier to use:
+ *      Now uses one field per line with simple labels, e.g.:
+ *
+ *      !announce
+ *      title: SharkBite UNCOPYLOCKED by BYTR (100% FREE!)
+ *      desc: Fresh update just dropped – completely uncopylocked & ready for you!
+ *      video: bRzzhZcNHr0
+ *      download: https://yobest-bytr.vercel.app/game/bRzzhZcNHr0
+ *      roblox: https://www.roblox.com/games/17410585589/Shark-BYTR
+ *
+ *      - Order doesn't matter, fields are optional except title+desc.
+ *      - "video:" accepts either a raw YouTube ID OR a full YouTube URL.
+ *      - Old pipe format `title|desc|yt_id|download|roblox` still works
+ *        as a fallback for backward compatibility.
  *
  *  - !site
- *      -> Tells users about https://yobest-bytr.vercel.app/
- *      -> AI also uses this info automatically when asked
- *
- *  - !help / !announce (admin)
- *  - !scanandclean (owner) -- now also scans image attachments
+ *  - !help / !setwelcome (admin)
+ *  - !scanandclean (owner) -- scans text + ALL images/files
  *  - Utility & fun: !ping, !stats, !serverinfo, !userinfo,
  *    !avatar, !roll, !8ball, !suggest
- *  - Upgraded welcome system: banner-style embed, member count,
- *    site link, and a "rules/intro" button
- *  - NEW: !setwelcome (admin) to customize the welcome message
+ *  - Upgraded welcome system
  * ========================================================
  */
 
@@ -43,8 +52,7 @@ const {
     ActionRowBuilder,
     ButtonBuilder,
     ButtonStyle,
-    PermissionFlagsBits,
-    AttachmentBuilder
+    PermissionFlagsBits
 } = require("discord.js");
 const OpenAI = require("openai");
 
@@ -55,7 +63,7 @@ const client = new Client({
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent,
         GatewayIntentBits.GuildModeration,
-        GatewayIntentBits.GuildMembers // required for welcome messages
+        GatewayIntentBits.GuildMembers
     ]
 });
 
@@ -65,23 +73,18 @@ const openai = new OpenAI({
 });
 
 // ====================== STATE ======================
-const aiEnabledChannels = new Set(); // channels where AI chat replies are enabled
-const violationCount = new Map();    // userId -> warning count
-const startTime = Date.now();        // for uptime in !stats
+const aiEnabledChannels = new Set();
+const violationCount = new Map();
+const startTime = Date.now();
 
-// Optional: set channel IDs via env vars, or leave null to disable that feature
 const WELCOME_CHANNEL_ID = process.env.WELCOME_CHANNEL_ID || null;
 const MODLOG_CHANNEL_ID = process.env.MODLOG_CHANNEL_ID || null;
 
-// Customizable welcome message (editable live via !setwelcome)
-// Use {user}, {server}, {count} as placeholders
 let welcomeMessage =
     "Hey {user}, welcome aboard **{server}**! 🎉\n" +
     "You're member **#{count}** of our growing community.";
 
 // ====================== SITE KNOWLEDGE ======================
-// Edit this block whenever your site changes. The AI uses this
-// as context so it can answer questions about Yobest Studio.
 const SITE_INFO = {
     name: "Yobest Studio",
     url: "https://yobest-bytr.vercel.app/",
@@ -99,17 +102,21 @@ const SITE_INFO = {
     ]
 };
 
+// File extensions that are commonly used to deliver scams/malware
+// when attached directly (executables, scripts, shortcuts, etc.)
+const DANGEROUS_FILE_EXTENSIONS = /\.(exe|bat|cmd|scr|msi|jar|vbs|ps1|lnk|com|apk)$/i;
+
 // ====================== READY ======================
 client.once("ready", () => {
     console.log(`✅ Yobest_BYTR Bot is Online! Logged in as ${client.user.tag}`);
 });
 
-// ====================== WELCOME SYSTEM (UPGRADED) ======================
+// ====================== WELCOME SYSTEM ======================
 client.on("guildMemberAdd", async (member) => {
     try {
         const channel = WELCOME_CHANNEL_ID
             ? member.guild.channels.cache.get(WELCOME_CHANNEL_ID)
-            : member.guild.systemChannel; // fallback to system channel
+            : member.guild.systemChannel;
 
         if (!channel) return;
 
@@ -127,7 +134,6 @@ client.on("guildMemberAdd", async (member) => {
             .setTitle(`👋 ${member.user.username} just joined!`)
             .setDescription(`${description}\n\n🔗 Explore our site: [${SITE_INFO.name}](${SITE_INFO.url})`)
             .setThumbnail(member.user.displayAvatarURL({ dynamic: true, size: 256 }))
-            // Large banner-style image at the bottom of the embed for visual impact
             .setImage("https://raw.githubusercontent.com/Yobest-Bytr/yobest-studio/refs/heads/main/bytrhhh.png")
             .setFooter({ text: `Member #${member.guild.memberCount} • ${SITE_INFO.name}` })
             .setTimestamp();
@@ -163,54 +169,30 @@ client.on("messageCreate", async (message) => {
                 .setColor(0x00FFAA)
                 .setDescription("Here's everything I can do:")
                 .addFields(
-                    { name: "📢 Announcement", value: "`!announce title|desc|yt_id|download|roblox`\nPosts an update announcement with download/play buttons." },
+                    {
+                        name: "📢 Announcement (NEW, easy format!)",
+                        value:
+                            "```\n!announce\ntitle: Your Title\ndesc: Your description\nvideo: youtube_id_or_url (optional)\ndownload: download_link (optional)\nroblox: roblox_link (optional)\n```\nOrder doesn't matter — only `title` and `desc` are required."
+                    },
                     { name: "🧠 AI Chat", value: "`!enableai` — enable AI chat replies in this channel\n`!disableai` — disable AI chat replies\n(Moderation stays active regardless)" },
-                    { name: "🔨 Moderation", value: "`!ban @user` | `!kick @user` | `!purge 50`\nGlobal smart auto-moderation is always active — checks text AND images for bad words, toxicity, scams, and phishing." },
+                    { name: "🔨 Moderation", value: "`!ban @user` | `!kick @user` | `!purge 50`\nGlobal smart auto-moderation is always active — scans text, images, AND file attachments for bad words, toxicity, scams, and phishing." },
                     { name: "👋 Welcome", value: "`!setwelcome <message>` — customize the welcome text\nPlaceholders: `{user}` `{server}` `{count}`" },
                     { name: "🌐 Site", value: "`!site` — info & links for Yobest Studio" },
                     { name: "✨ Utility", value: "`!ping` — bot latency\n`!stats` — server & bot stats\n`!serverinfo` — server details\n`!userinfo [@user]` — user details\n`!avatar [@user]` — show avatar" },
                     { name: "🎉 Fun", value: "`!roll [NdN]` — roll dice (e.g. `!roll 2d6`)\n`!8ball <question>` — magic 8-ball\n`!suggest <text>` — submit a suggestion" },
-                    { name: "👑 Owner", value: "`!scanandclean` — scan & delete bad messages (text + images) from the last 100" }
+                    { name: "👑 Owner", value: "`!scanandclean` — scan & delete bad messages (text + images + files) from the last 100" }
                 )
                 .setFooter({ text: "Yobest_BYTR Bot" })
                 .setTimestamp();
             return message.reply({ embeds: [embed] });
         }
 
-        // ---- !announce ----
-        if (lower.startsWith("!announce ")) {
-            const args = content.slice(10).split("|").map(s => s.trim());
-            if (args.length < 5) {
-                return message.reply("❌ Usage: `!announce title|description|youtube_id|download_url|roblox_url`");
-            }
-
-            const [title, description, ytId, downloadUrl, robloxUrl] = args;
-
-            const embed = new EmbedBuilder()
-                .setTitle(`🚨 ${title}`)
-                .setDescription(description)
-                .setColor(0x00FFAA)
-                .setImage(`https://img.youtube.com/vi/${ytId}/maxresdefault.jpg`)
-                .addFields(
-                    { name: "⬇️ Download", value: `[Click Here](${downloadUrl})` },
-                    { name: "🎮 Play Roblox", value: `[Play Now](${robloxUrl})` }
-                )
-                .setTimestamp();
-
-            const row = new ActionRowBuilder().addComponents(
-                new ButtonBuilder().setLabel("Download").setStyle(ButtonStyle.Link).setURL(downloadUrl).setEmoji("📥"),
-                new ButtonBuilder().setLabel("Play Roblox").setStyle(ButtonStyle.Link).setURL(robloxUrl).setEmoji("🎮")
-            );
-
-            await message.channel.send({
-                content: "@everyone @here 🚨 **New Update by BYTR** 🚨",
-                embeds: [embed],
-                components: [row]
-            });
-            return message.reply("✅ Announcement posted successfully!");
+        // ---- !announce (new easy format + legacy fallback) ----
+        if (lower === "!announce" || lower.startsWith("!announce ") || lower.startsWith("!announce\n")) {
+            return handleAnnounce(message, content);
         }
 
-        // ---- !enableai (only toggles AI chat replies) ----
+        // ---- !enableai ----
         if (lower === "!enableai") {
             aiEnabledChannels.add(message.channel.id);
             return message.reply("✅ **AI Chat Replies Enabled** in this channel.\n(🛡️ Moderation is always active, regardless of this setting.)");
@@ -241,16 +223,15 @@ client.on("messageCreate", async (message) => {
     }
 
     // ====================== GLOBAL SMART MODERATION (ALWAYS ACTIVE) ======================
-    const modResult = await moderateMessage(message);
+    const modResult = await moderateMessage(message, { allowEmbedRetry: true });
     if (modResult.flagged) {
         await message.delete().catch(() => {});
         await applyTimeout(message, modResult.reason, modResult.category, modResult.evidenceUrl);
         return;
     }
 
-    // ====================== UTILITY & FUN COMMANDS (anyone can use) ======================
+    // ====================== UTILITY & FUN COMMANDS ======================
 
-    // ---- !ping ----
     if (lower === "!ping") {
         const sent = await message.reply("🏓 Pinging...");
         const latency = sent.createdTimestamp - message.createdTimestamp;
@@ -258,7 +239,6 @@ client.on("messageCreate", async (message) => {
         return sent.edit(`🏓 Pong! Message latency: **${latency}ms** | API latency: **${apiLatency}ms**`);
     }
 
-    // ---- !stats ----
     if (lower === "!stats") {
         const uptimeMs = Date.now() - startTime;
         const uptimeStr = formatUptime(uptimeMs);
@@ -271,14 +251,13 @@ client.on("messageCreate", async (message) => {
                 { name: "⏱️ Bot Uptime", value: uptimeStr, inline: true },
                 { name: "🌐 Servers Connected", value: `${client.guilds.cache.size}`, inline: true },
                 { name: "🧠 AI Chat Status", value: aiEnabledChannels.has(message.channel.id) ? "Enabled here" : "Disabled here", inline: true },
-                { name: "🛡️ Moderation", value: "Always Active (text + image AI scan)", inline: true }
+                { name: "🛡️ Moderation", value: "Always Active (text + image + file scan)", inline: true }
             )
             .setTimestamp();
 
         return message.reply({ embeds: [embed] });
     }
 
-    // ---- !serverinfo ----
     if (lower === "!serverinfo") {
         const guild = message.guild;
         const embed = new EmbedBuilder()
@@ -297,7 +276,6 @@ client.on("messageCreate", async (message) => {
         return message.reply({ embeds: [embed] });
     }
 
-    // ---- !userinfo [@user] ----
     if (lower === "!userinfo" || lower.startsWith("!userinfo ")) {
         const target = message.mentions.members?.first() || message.member;
         const embed = new EmbedBuilder()
@@ -314,7 +292,6 @@ client.on("messageCreate", async (message) => {
         return message.reply({ embeds: [embed] });
     }
 
-    // ---- !avatar [@user] ----
     if (lower === "!avatar" || lower.startsWith("!avatar ")) {
         const target = message.mentions.users?.first() || message.author;
         const embed = new EmbedBuilder()
@@ -324,7 +301,6 @@ client.on("messageCreate", async (message) => {
         return message.reply({ embeds: [embed] });
     }
 
-    // ---- !roll [NdN] ----
     if (lower === "!roll" || lower.startsWith("!roll ")) {
         const arg = content.split(" ")[1] || "1d6";
         const match = arg.match(/^(\d+)d(\d+)$/i);
@@ -340,7 +316,6 @@ client.on("messageCreate", async (message) => {
         return message.reply(`🎲 Rolling **${count}d${sides}**: [${rolls.join(", ")}] → Total: **${total}**`);
     }
 
-    // ---- !8ball ----
     if (lower === "!8ball" || lower.startsWith("!8ball ")) {
         const question = content.split(" ").slice(1).join(" ");
         if (!question) return message.reply("❌ Usage: `!8ball <your question>`");
@@ -362,7 +337,6 @@ client.on("messageCreate", async (message) => {
         return message.reply({ embeds: [embed] });
     }
 
-    // ---- !suggest ----
     if (lower === "!suggest" || lower.startsWith("!suggest ")) {
         const suggestion = content.split(" ").slice(1).join(" ");
         if (!suggestion) return message.reply("❌ Usage: `!suggest <your idea>`");
@@ -380,7 +354,6 @@ client.on("messageCreate", async (message) => {
         return message.delete().catch(() => {});
     }
 
-    // ---- !site ----
     if (lower === "!site") {
         const embed = new EmbedBuilder()
             .setTitle(`🌐 ${SITE_INFO.name}`)
@@ -416,44 +389,209 @@ client.on("messageCreate", async (message) => {
     }
 });
 
+// ====================== ANNOUNCE (NEW EASY FORMAT) ======================
+
+/**
+ * Parses and posts an announcement.
+ *
+ * NEW FORMAT (recommended) — one field per line, any order:
+ *   !announce
+ *   title: ...
+ *   desc: ...
+ *   video: <youtube id or full URL>   (optional)
+ *   download: <url>                   (optional)
+ *   roblox: <url>                     (optional)
+ *
+ * LEGACY FORMAT (still supported) — pipe separated, fixed order:
+ *   !announce title|desc|yt_id|download|roblox
+ */
+async function handleAnnounce(message, content) {
+    // Strip the command itself ("!announce" with optional trailing text on same line)
+    const body = content.replace(/^!announce/i, "").trim();
+
+    if (!body) {
+        return message.reply(
+            "❌ **Usage:**\n```\n!announce\ntitle: Your Title\ndesc: Your description\nvideo: youtube_id_or_url (optional)\ndownload: download_link (optional)\nroblox: roblox_link (optional)\n```"
+        );
+    }
+
+    let title, description, ytId, downloadUrl, robloxUrl;
+
+    // Detect new "label: value" format (at least one line contains "title:" or "desc:")
+    const isNewFormat = /^(title|desc|description)\s*:/im.test(body);
+
+    if (isNewFormat) {
+        const fields = {};
+        // Split on newlines, but also allow the whole thing inline if needed
+        const lines = body.split("\n").map(l => l.trim()).filter(Boolean);
+
+        let currentKey = null;
+        for (const line of lines) {
+            const match = line.match(/^(title|desc(?:ription)?|video|youtube|download|roblox)\s*:\s*(.*)$/i);
+            if (match) {
+                currentKey = match[1].toLowerCase();
+                if (currentKey === "description") currentKey = "desc";
+                if (currentKey === "youtube") currentKey = "video";
+                fields[currentKey] = match[2].trim();
+            } else if (currentKey) {
+                // Multi-line value (e.g. a long description) - append
+                fields[currentKey] += "\n" + line;
+            }
+        }
+
+        title = fields.title;
+        description = fields.desc;
+        downloadUrl = fields.download ? extractUrl(fields.download) : null;
+        robloxUrl = fields.roblox ? extractUrl(fields.roblox) : null;
+        ytId = fields.video ? extractYouTubeId(fields.video) : null;
+
+        if (!title || !description) {
+            return message.reply("❌ Missing required fields. You must include at least `title:` and `desc:`.");
+        }
+    } else {
+        // Legacy pipe format
+        const args = body.split("|").map(s => s.trim());
+        if (args.length < 2) {
+            return message.reply(
+                "❌ **Usage:**\n```\n!announce\ntitle: Your Title\ndesc: Your description\nvideo: youtube_id_or_url (optional)\ndownload: download_link (optional)\nroblox: roblox_link (optional)\n```\nOr legacy: `!announce title|desc|yt_id|download|roblox`"
+            );
+        }
+        [title, description, ytId, downloadUrl, robloxUrl] = args;
+        if (ytId) ytId = extractYouTubeId(ytId);
+        if (downloadUrl) downloadUrl = extractUrl(downloadUrl);
+        if (robloxUrl) robloxUrl = extractUrl(robloxUrl);
+    }
+
+    const embed = new EmbedBuilder()
+        .setTitle(`🚨 ${title}`)
+        .setDescription(description)
+        .setColor(0x00FFAA)
+        .setTimestamp();
+
+    if (ytId) {
+        embed.setImage(`https://img.youtube.com/vi/${ytId}/maxresdefault.jpg`);
+    }
+
+    const fieldsToAdd = [];
+    if (downloadUrl) fieldsToAdd.push({ name: "⬇️ Download", value: `[Click Here](${downloadUrl})` });
+    if (robloxUrl) fieldsToAdd.push({ name: "🎮 Play Roblox", value: `[Play Now](${robloxUrl})` });
+    if (fieldsToAdd.length) embed.addFields(fieldsToAdd);
+
+    const row = new ActionRowBuilder();
+    if (downloadUrl) row.addComponents(new ButtonBuilder().setLabel("Download").setStyle(ButtonStyle.Link).setURL(downloadUrl).setEmoji("📥"));
+    if (robloxUrl) row.addComponents(new ButtonBuilder().setLabel("Play Roblox").setStyle(ButtonStyle.Link).setURL(robloxUrl).setEmoji("🎮"));
+
+    const payload = {
+        content: "@everyone @here 🚨 **New Update by BYTR** 🚨",
+        embeds: [embed]
+    };
+    if (row.components.length) payload.components = [row];
+
+    await message.channel.send(payload);
+    return message.reply("✅ Announcement posted successfully!");
+}
+
+/**
+ * Extracts a YouTube video ID from either a raw ID or a full URL
+ * (supports youtube.com/watch?v=, youtu.be/, youtube.com/shorts/).
+ */
+function extractYouTubeId(input) {
+    if (!input) return null;
+    const trimmed = input.trim();
+
+    // Already looks like a plain video ID (11 chars, no slashes/spaces)
+    if (/^[a-zA-Z0-9_-]{11}$/.test(trimmed)) return trimmed;
+
+    const patterns = [
+        /(?:youtube\.com\/watch\?v=)([a-zA-Z0-9_-]{11})/,
+        /(?:youtu\.be\/)([a-zA-Z0-9_-]{11})/,
+        /(?:youtube\.com\/shorts\/)([a-zA-Z0-9_-]{11})/
+    ];
+    for (const pattern of patterns) {
+        const m = trimmed.match(pattern);
+        if (m) return m[1];
+    }
+    return trimmed; // fall back to whatever was given
+}
+
+/**
+ * Extracts a raw URL from input that might be wrapped in
+ * markdown link syntax like "[Label](https://...)".
+ */
+function extractUrl(input) {
+    if (!input) return null;
+    const trimmed = input.trim();
+    const markdownMatch = trimmed.match(/\[.*?\]\((https?:\/\/[^\s)]+)\)/);
+    if (markdownMatch) return markdownMatch[1];
+
+    const urlMatch = trimmed.match(/https?:\/\/\S+/);
+    if (urlMatch) return urlMatch[0];
+
+    return trimmed;
+}
+
 // ====================== SMART MODERATION ======================
 
 /**
- * Returns the first image URL attached to or embedded in a message,
- * or null if there isn't one. Covers direct attachments AND
- * image embeds (e.g. pasted links that Discord auto-embeds).
+ * Collects ALL image attachment URLs from a message (not just the first),
+ * plus image URLs from any link-preview embeds.
  */
-function getImageUrl(message) {
-    const attachment = message.attachments.find(a =>
-        a.contentType?.startsWith("image/") ||
-        /\.(png|jpe?g|gif|webp)$/i.test(a.url)
-    );
-    if (attachment) return attachment.url;
+function getImageUrls(message) {
+    const urls = [];
 
-    const embedImage = message.embeds.find(e => e.image || e.thumbnail);
-    if (embedImage) return (embedImage.image || embedImage.thumbnail).url;
+    for (const attachment of message.attachments.values()) {
+        if (attachment.contentType?.startsWith("image/") || /\.(png|jpe?g|gif|webp)$/i.test(attachment.url)) {
+            urls.push(attachment.url);
+        }
+    }
 
-    return null;
+    for (const embed of message.embeds) {
+        if (embed.image?.url) urls.push(embed.image.url);
+        if (embed.thumbnail?.url) urls.push(embed.thumbnail.url);
+    }
+
+    return [...new Set(urls)];
+}
+
+/**
+ * Returns any non-image attachments (files), with name + URL.
+ */
+function getFileAttachments(message) {
+    const files = [];
+    for (const attachment of message.attachments.values()) {
+        const isImage = attachment.contentType?.startsWith("image/") || /\.(png|jpe?g|gif|webp)$/i.test(attachment.url);
+        if (!isImage) files.push(attachment);
+    }
+    return files;
 }
 
 /**
  * Checks a message for:
- *  - Bad/profane words (fast regex check on text)
+ *  - Bad/profane words (text)
  *  - AI text classification: toxic / scam / phishing
- *  - AI IMAGE classification: scans any attached/embedded image
- *    for scam/phishing screenshots (fake giveaways, crypto scams,
- *    impersonation posts, etc.)
+ *  - Dangerous file attachments (.exe, .bat, .apk, etc.)
+ *  - AI IMAGE classification on ALL images (attachments + embeds),
+ *    with an optional retry after a short delay in case Discord
+ *    hasn't generated the link-preview embed yet.
  *
  * Returns: { flagged: bool, reason: string, category: string, evidenceUrl: string|null }
  */
-async function moderateMessage(message) {
+async function moderateMessage(message, options = {}) {
     const text = message.content;
-    const imageUrl = getImageUrl(message);
 
     // ---- Fast regex: profanity ----
     const badWords = /fuck|sex|shit|bitch|asshole|cunt|fucker|damn|bastard/i;
     if (badWords.test(text)) {
-        return { flagged: true, reason: "Inappropriate language", category: "language", evidenceUrl: imageUrl };
+        const imgs = getImageUrls(message);
+        return { flagged: true, reason: "Inappropriate language", category: "language", evidenceUrl: imgs[0] || null };
+    }
+
+    // ---- Dangerous file attachments ----
+    const files = getFileAttachments(message);
+    for (const file of files) {
+        if (DANGEROUS_FILE_EXTENSIONS.test(file.name)) {
+            return { flagged: true, reason: `Suspicious/dangerous file attachment (${file.name})`, category: "file", evidenceUrl: null };
+        }
     }
 
     // ---- AI check: text content ----
@@ -478,23 +616,38 @@ Message: "${text}"`
             });
 
             const category = (res.choices[0].message.content || "").toUpperCase().trim();
+            const imgs = getImageUrls(message);
 
             if (category.includes("TOXIC")) {
-                return { flagged: true, reason: "Toxic / harassing message", category: "toxic", evidenceUrl: imageUrl };
+                return { flagged: true, reason: "Toxic / harassing message", category: "toxic", evidenceUrl: imgs[0] || null };
             }
             if (category.includes("SCAM")) {
-                return { flagged: true, reason: "Scam content (fake giveaway / free items link)", category: "scam", evidenceUrl: imageUrl };
+                return { flagged: true, reason: "Scam content (fake giveaway / free items link)", category: "scam", evidenceUrl: imgs[0] || null };
             }
             if (category.includes("PHISH")) {
-                return { flagged: true, reason: "Phishing link / fake account warning", category: "phishing", evidenceUrl: imageUrl };
+                return { flagged: true, reason: "Phishing link / fake account warning", category: "phishing", evidenceUrl: imgs[0] || null };
             }
         } catch {
-            // fail safe: continue to image check even if text check fails
+            // continue to image check
         }
     }
 
-    // ---- AI check: image content (vision) ----
-    if (imageUrl) {
+    // ---- AI check: ALL images ----
+    let imageUrls = getImageUrls(message);
+
+    // If there's a link but no embed image yet, Discord may still be generating
+    // the preview. Wait briefly and re-check once.
+    if (imageUrls.length === 0 && options.allowEmbedRetry && /https?:\/\//.test(text)) {
+        await new Promise(r => setTimeout(r, 1500));
+        try {
+            const fresh = await message.channel.messages.fetch(message.id);
+            imageUrls = getImageUrls(fresh);
+        } catch {
+            // message may have been deleted already, ignore
+        }
+    }
+
+    for (const imageUrl of imageUrls) {
         try {
             const res = await openai.chat.completions.create({
                 model: "google/gemini-3.5-flash",
@@ -532,7 +685,7 @@ Image:`
                 return { flagged: true, reason: "Image contains NSFW/graphic content", category: "nsfw", evidenceUrl: imageUrl };
             }
         } catch {
-            // fail safe: don't block if vision check fails
+            // fail safe: skip this image, check the next one
         }
     }
 
@@ -541,7 +694,6 @@ Image:`
 
 /**
  * Applies a warning, then a 10-minute timeout on repeat offenses.
- * Also logs the action to the mod-log channel (if configured).
  */
 async function applyTimeout(message, reason, category, evidenceUrl) {
     const userId = message.author.id;
@@ -563,7 +715,6 @@ async function applyTimeout(message, reason, category, evidenceUrl) {
 
 /**
  * Sends a detailed log entry to the mod-log channel, if configured.
- * Includes the flagged image (if any) as evidence.
  */
 async function logToModChannel(message, reason, category, actionTaken, count, evidenceUrl) {
     if (!MODLOG_CHANNEL_ID) return;
@@ -577,7 +728,8 @@ async function logToModChannel(message, reason, category, actionTaken, count, ev
             toxic: "☢️",
             scam: "🎭",
             phishing: "🎣",
-            nsfw: "🔞"
+            nsfw: "🔞",
+            file: "📁"
         };
 
         const embed = new EmbedBuilder()
@@ -604,11 +756,6 @@ async function logToModChannel(message, reason, category, actionTaken, count, ev
 
 // ====================== AI CHAT / SCRIPT GENERATION ======================
 
-/**
- * Gets a response from the AI model.
- * If the response appears to be a Lua script that got cut off
- * (unbalanced ``` fences), it requests a continuation and merges it.
- */
 async function getAIResponse(message) {
     const userInput = message.content.replace(/<@!?[0-9]+>/g, "").trim() || "Hello";
 
@@ -634,7 +781,6 @@ RULES:
     try {
         let fullText = await requestCompletion(systemPrompt, userInput);
 
-        // If the response contains an unclosed ```lua block, request the rest
         let attempts = 0;
         while (hasUnclosedCodeBlock(fullText) && attempts < 3) {
             attempts++;
@@ -652,9 +798,6 @@ RULES:
     }
 }
 
-/**
- * Single completion request to the AI model.
- */
 async function requestCompletion(systemPrompt, userInput) {
     const completion = await openai.chat.completions.create({
         model: "google/gemini-3.5-flash",
@@ -669,22 +812,11 @@ async function requestCompletion(systemPrompt, userInput) {
     return completion.choices[0].message.content || "";
 }
 
-/**
- * Returns true if the text contains an odd number of ``` fences,
- * meaning a code block was opened but never closed.
- */
 function hasUnclosedCodeBlock(text) {
     const fenceCount = (text.match(/```/g) || []).length;
     return fenceCount % 2 !== 0;
 }
 
-/**
- * Sends the AI's response in a clean, cohesive way:
- *  - If it contains a Lua code block, sends an intro embed with
- *    any text before the code, then the code block(s) (split to
- *    fit Discord's limit, fences preserved across chunks).
- *  - If it's plain text, sends it normally (split if too long).
- */
 async function sendAIResponse(message, text) {
     const MAX_LENGTH = 1900;
     const codeBlockMatch = text.match(/```lua[\s\S]*?```/);
@@ -694,7 +826,6 @@ async function sendAIResponse(message, text) {
         const introText = text.slice(0, codeBlockMatch.index).trim();
         const afterText = text.slice(codeBlockMatch.index + codeBlock.length).trim();
 
-        // Send intro as an embed (if there's any explanation text)
         if (introText) {
             const embed = new EmbedBuilder()
                 .setTitle("📜 Script Ready")
@@ -703,7 +834,6 @@ async function sendAIResponse(message, text) {
             await message.reply({ embeds: [embed] });
         }
 
-        // Send the code block(s), split if too long, fences preserved
         const codeChunks = splitWithFences(codeBlock, MAX_LENGTH);
         const totalParts = codeChunks.length;
         for (let i = 0; i < codeChunks.length; i++) {
@@ -711,20 +841,15 @@ async function sendAIResponse(message, text) {
             await message.channel.send(label + codeChunks[i]);
         }
 
-        // Send any trailing explanation text
         if (afterText) {
             await sendPlainText(message, afterText, MAX_LENGTH);
         }
         return;
     }
 
-    // No code block: just send as plain text (split if needed)
     await sendPlainText(message, text, MAX_LENGTH);
 }
 
-/**
- * Sends plain text, splitting on newlines if it exceeds MAX_LENGTH.
- */
 async function sendPlainText(message, text, maxLength) {
     if (text.length <= maxLength) {
         return message.reply(text);
@@ -749,13 +874,7 @@ async function sendPlainText(message, text, maxLength) {
     }
 }
 
-/**
- * Splits a single fenced code block (```lua ... ```) into multiple
- * chunks under maxLength, re-opening/closing the fence on each chunk
- * so every chunk renders as valid Lua code in Discord.
- */
 function splitWithFences(codeBlock, maxLength) {
-    // Strip outer fences to get raw code
     const inner = codeBlock.replace(/^```lua\n?/, "").replace(/```$/, "");
     const fenceOverhead = "```lua\n\n```".length;
     const effectiveMax = maxLength - fenceOverhead;
@@ -794,13 +913,13 @@ function formatUptime(ms) {
 // ====================== OWNER: SCAN & CLEAN ======================
 
 async function scanAndCleanChannel(message) {
-    await message.reply("🔍 Scanning last 100 messages (text + images)...");
+    await message.reply("🔍 Scanning last 100 messages (text + images + files)...");
     try {
         const msgs = await message.channel.messages.fetch({ limit: 100 });
         let deleted = 0;
         for (const msg of msgs.values()) {
             if (!msg.author.bot) {
-                const result = await moderateMessage(msg);
+                const result = await moderateMessage(msg, { allowEmbedRetry: false });
                 if (result.flagged) {
                     await msg.delete().catch(() => {});
                     deleted++;
