@@ -21,6 +21,7 @@ const openai = new OpenAI({
 });
 
 const aiEnabledChannels = new Set();
+const violationCount = new Map(); // Track bad behavior per user
 
 client.once("ready", () => {
     console.log(`✅ Yobest_BYTR Bot is Online: ${client.user.tag}`);
@@ -34,11 +35,12 @@ client.on("messageCreate", async (message) => {
     const isAdmin = message.member?.permissions.has(PermissionFlagsBits.Administrator);
     const isOwner = message.guild.ownerId === message.author.id;
 
-    // ====================== OWNER & ADMIN COMMANDS ======================
+    // OWNER COMMANDS
     if (isOwner && lower === "!scanandclean") {
         return await scanAndCleanChannel(message);
     }
 
+    // ADMIN COMMANDS
     if (isAdmin) {
         if (lower === "!help") {
             const embed = new EmbedBuilder()
@@ -47,14 +49,32 @@ client.on("messageCreate", async (message) => {
                 .addFields(
                     { name: "📢 Announcement", value: "`!announce title|desc|yt_id|download|roblox`" },
                     { name: "🧠 AI", value: "`!enableai` | `!disableai`" },
-                    { name: "🔨 Moderation", value: "`!ban @user` | `!kick @user` | `!purge 50` | `!warn @user`" },
+                    { name: "🔨 Moderation", value: "`!ban @user` | `!kick @user` | `!purge 50`" },
                     { name: "👑 Owner", value: "`!scanandclean`" }
                 );
             return message.reply({ embeds: [embed] });
         }
 
-        if (lower.startsWith("!announce ")) { /* Keep your announce function */ 
-            // ... (same as previous version - omitted for brevity)
+        if (lower.startsWith("!announce ")) {
+            const args = content.slice(10).split("|").map(s => s.trim());
+            if (args.length < 5) return message.reply("❌ Usage: `!announce title|description|youtube_id|download_url|roblox_url`");
+            // ... (announce code same as before)
+            const [title, description, ytId, downloadUrl, robloxUrl] = args;
+            const embed = new EmbedBuilder()
+                .setTitle(`🚨 ${title}`)
+                .setDescription(description)
+                .setColor(0x00FFAA)
+                .setImage(`https://img.youtube.com/vi/${ytId}/maxresdefault.jpg`)
+                .addFields(
+                    { name: "⬇️ Download", value: `[Click Here](${downloadUrl})` },
+                    { name: "🎮 Play", value: `[Play Now](${robloxUrl})` }
+                );
+            const row = new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setLabel("Download").setStyle(ButtonStyle.Link).setURL(downloadUrl),
+                new ButtonBuilder().setLabel("Play Roblox").setStyle(ButtonStyle.Link).setURL(robloxUrl)
+            );
+            await message.channel.send({ content: "@everyone @here 🚨 **New Update by BYTR** 🚨", embeds: [embed], components: [row] });
+            return message.reply("✅ Announcement posted!");
         }
 
         if (lower === "!enableai") {
@@ -67,31 +87,42 @@ client.on("messageCreate", async (message) => {
         }
     }
 
-    // ====================== AI INTERACTION ======================
+    // ====================== AI SYSTEM ======================
     if (aiEnabledChannels.has(message.channel.id)) {
-        const shouldDelete = await moderateMessage(message);
-        if (shouldDelete) {
+        const isBad = await moderateMessage(message);
+        if (isBad) {
             await message.delete().catch(() => {});
-            return message.channel.send("⚠️ Inappropriate message removed.");
+            await applyTimeout(message);
+            return;
         }
 
         const isMentioned = message.mentions.has(client.user);
-        const containsTrigger = lower.includes("yobest") || lower.includes("bot") || lower.includes("help") || lower.includes("code") || lower.includes("script");
+        const hasTrigger = lower.includes("yobest") || lower.includes("bot") || lower.includes("help") || 
+                          lower.includes("script") || lower.includes("code") || lower.startsWith("hello");
 
-        if (isMentioned || containsTrigger || lower.startsWith("hello")) {
-            // React to show processing
+        if (isMentioned || hasTrigger || Math.random() < 0.5) {
+            // Show thinking message
+            const thinkingMsg = await message.reply("🤔 **Yobest is thinking...**");
+
+            // Multiple reactions
             await message.react("❤️").catch(() => {});
+            await message.react("👍").catch(() => {});
+            await message.react("🎮").catch(() => {});
 
             const response = await getAIResponse(message);
+            
+            // Delete thinking message and send real reply
+            await thinkingMsg.delete().catch(() => {});
+            
             if (response) {
                 const reply = await message.reply(response);
-
-                // Create Thread for better conversation
-                if (lower.includes("script") || lower.includes("code") || lower.includes("help")) {
+                
+                // Create thread for script requests
+                if (lower.includes("script") || lower.includes("code")) {
                     try {
                         await reply.startThread({
-                            name: `Discussion - ${message.author.username}`,
-                            autoArchiveDuration: 1440, // 24 hours
+                            name: `Roblox Script Help - ${message.author.username}`,
+                            autoArchiveDuration: 1440,
                         });
                     } catch (e) {}
                 }
@@ -104,11 +135,27 @@ async function moderateMessage(message) {
     try {
         const res = await openai.chat.completions.create({
             model: "google/gemini-3.5-flash",
-            messages: [{ role: "user", content: `Is this message toxic, spam, scam, NSFW or rule-breaking? Answer ONLY YES or NO.\nMessage: ${message.content.substring(0, 500)}` }],
+            messages: [{ role: "user", content: `Is this message toxic, spam, scam, advertising, NSFW or against rules? Answer ONLY with YES or NO.\nMessage: ${message.content.substring(0, 600)}` }],
             max_tokens: 10
         });
-        return res.choices[0].message.content.toUpperCase().includes("YES");
+        return res.choices[0].message.content.toUpperCase().trim().includes("YES");
     } catch { return false; }
+}
+
+async function applyTimeout(message) {
+    const userId = message.author.id;
+    const current = (violationCount.get(userId) || 0) + 1;
+    violationCount.set(userId, current);
+
+    try {
+        const member = message.member;
+        if (current >= 2) {
+            await member.timeout(5 * 60 * 1000, "Repeated violations"); // 5 minutes timeout
+            await message.channel.send(`⛔ ${message.author} has been timed out for 5 minutes due to violations.`);
+        } else {
+            await message.channel.send(`⚠️ ${message.author} Watch your language or you will be timed out.`);
+        }
+    } catch (e) {}
 }
 
 async function getAIResponse(message) {
@@ -117,28 +164,25 @@ async function getAIResponse(message) {
     const messages = [
         { 
             role: "system", 
-            content: `You are Yobest, a professional and friendly Roblox Lua scripting expert.
-Always respond in clear English.
-**Always** put code inside proper markdown code blocks like this:
+            content: `You are Yobest, a highly skilled Roblox Lua scripting expert.
+Always answer in clear English.
+**Always** use proper code blocks:
 \`\`\`lua
--- your code here
+-- code here
 \`\`\`
-Be detailed, clean, and well-commented. Use best practices.` 
+Be helpful, detailed, and use best practices.` 
         },
         { role: "user", content: userInput }
     ];
 
     // Image support
     if (message.attachments.size > 0) {
-        const imageParts = Array.from(message.attachments.values())
-            .filter(att => att.contentType?.startsWith("image/"))
-            .map(att => ({ type: "image_url", image_url: { url: att.url } }));
+        const images = Array.from(message.attachments.values())
+            .filter(a => a.contentType?.startsWith("image/"))
+            .map(a => ({ type: "image_url", image_url: { url: a.url } }));
 
-        if (imageParts.length > 0) {
-            messages.push({
-                role: "user",
-                content: [{ type: "text", text: "Please analyze this image and help with the Roblox script:" }, ...imageParts]
-            });
+        if (images.length) {
+            messages.push({ role: "user", content: [{ type: "text", text: "Analyze this image for Roblox scripting:" }, ...images] });
         }
     }
 
@@ -146,31 +190,31 @@ Be detailed, clean, and well-commented. Use best practices.`
         const completion = await openai.chat.completions.create({
             model: "google/gemini-3.5-flash",
             messages,
-            max_tokens: 900,
-            temperature: 0.65
+            max_tokens: 950,
+            temperature: 0.7
         });
         return completion.choices[0].message.content;
     } catch (err) {
         console.error(err);
-        return "I'm here to help! What Roblox script do you need?";
+        return "I'm ready! How can I help you with Roblox today?";
     }
 }
 
 async function scanAndCleanChannel(message) {
-    await message.reply("🔍 Scanning last 100 messages...");
+    await message.reply("🔍 Scanning recent messages...");
     try {
-        const fetched = await message.channel.messages.fetch({ limit: 100 });
-        let count = 0;
-        for (const msg of fetched.values()) {
+        const msgs = await message.channel.messages.fetch({ limit: 100 });
+        let deleted = 0;
+        for (const msg of msgs.values()) {
             if (msg.author.bot) continue;
             if (await moderateMessage(msg)) {
                 await msg.delete().catch(() => {});
-                count++;
+                deleted++;
             }
         }
-        await message.channel.send(`✅ Scan finished. Deleted **${count}** bad messages.`);
+        await message.channel.send(`✅ Scan complete. Deleted **${deleted}** bad messages.`);
     } catch (e) {
-        await message.channel.send("❌ Scan error.");
+        await message.channel.send("❌ Scan failed.");
     }
 }
 
