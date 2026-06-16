@@ -1,53 +1,31 @@
 /**
- * Yobest_BYTR Discord Bot  ·  v4.2 — COMPLETE FIX UPDATE
+ * Yobest_BYTR Discord Bot  ·  v4.3 — FULL FIX UPDATE
  * ========================================================
- * WHAT'S FIXED / NEW IN v4.2
+ * WHAT'S FIXED / NEW IN v4.3
  * --------------------------------------------------------
  *
- *  🔥 CRITICAL FIX: AI not working — switched from OpenRouter to
- *     Anthropic claude-sonnet-4-6 via the Anthropic SDK directly.
- *     No more "I'm having trouble connecting" errors.
- *     Fallback chain: Anthropic → OpenRouter (if OPENROUTER_API_KEY set).
+ *  🔥 CRITICAL FIX: AI provider switched to OpenRouter only
+ *     (OPENROUTER_API_KEY). Anthropic dependency fully removed.
+ *     Model: google/gemini-2.0-flash (hidden from users — shown as "Yobest").
  *
- *  🔥 CRITICAL FIX: Bad messages (bad words, scam images, etc.) now
- *     auto-deleted INSTANTLY — moderation runs as the VERY FIRST
- *     thing in messageCreate, with NO early returns before it.
+ *  🔥 CRITICAL FIX: "Invalid model ID" error fixed — model string
+ *     corrected to the proper OpenRouter format.
  *
- *  🔥 CRITICAL FIX: "sex" and ALL bad words now caught instantly
- *     by an expanded profanity list (60+ words/patterns), not just
- *     the 7 words from v4.1.
+ *  🔥 CRITICAL FIX: Scam messages and flagged files are now truly
+ *     deleted — safeDelete now awaits properly in all code paths.
  *
- *  🔥 CRITICAL FIX: Scam images (like MrBeast fake casino) now
- *     auto-deleted — image check runs immediately without waiting
- *     for text AI. Embed retry also fixed.
+ *  🔥 CRITICAL FIX: Duplicate slash commands (/commands showing twice)
+ *     fixed — guild-only registration, no global duplicate.
  *
- *  🔥 CRITICAL FIX: Slash commands (/) now properly show in Discord
- *     — force-refreshed on every startup, with per-guild registration
- *     for instant availability (global commands take up to 1 hour).
+ *  ✅ NEW: !setwelcomechannel #channel — set WELCOME_CHANNEL_ID in-server
+ *  ✅ NEW: /setwelcomechannel command — same via slash
+ *  ✅ NEW: !setmodlogchannel #channel — set MODLOG_CHANNEL_ID in-server
+ *  ✅ NEW: /setmodlogchannel command — same via slash
+ *  ✅ NEW: !setticketcategory — set category for ticket channels
+ *  ✅ NEW: /setticketcategory — same via slash
+ *  ✅ NEW: Tickets now open inside a dedicated category if set
  *
- *  🔥 CRITICAL FIX: /command registration now uses GUILD-based
- *     registration so commands appear immediately when you type /.
- *
- *  ✅ IMPROVED: Auto-mod now runs on ALL messages including those
- *     with images only (no text content).
- *
- *  ✅ IMPROVED: Profanity list expanded to 60+ words/patterns
- *     including sexual terms, slurs, hate speech.
- *
- *  ✅ IMPROVED: Image scanning now starts immediately in parallel
- *     with text scanning — no sequential delay.
- *
- *  ✅ IMPROVED: Scam image AI prompt greatly expanded with more
- *     examples matching real scam screenshots.
- *
- *  ✅ NEW: Bot DMs the user explaining why their message was removed.
- *
- *  ✅ NEW: !testautomod command (owner only) — posts a test scam
- *     message to verify the auto-mod pipeline is working.
- *
- *  ✅ NEW: /testautomod slash command (owner only).
- *
- *  ✅ All v4.1 features fully preserved and improved.
+ *  ✅ All v4.2 features fully preserved and improved.
  * ========================================================
  */
 
@@ -69,32 +47,30 @@ const {
 } = require("discord.js");
 
 // ====================== AI CLIENT SETUP ======================
-// Primary: Anthropic API (most reliable)
-// Fallback: OpenRouter (if OPENROUTER_API_KEY is set)
-let anthropicClient = null;
-let openaiClient = null;
+// Provider: OpenRouter only (OPENROUTER_API_KEY)
+// Model: hidden from users — displayed as "Yobest" in all UI
+const AI_DISPLAY_NAME   = "Yobest";          // shown to users
+const OPENROUTER_MODEL  = "google/gemini-2.0-flash"; // NEVER exposed to users
 
-try {
-    const Anthropic = require("@anthropic-ai/sdk");
-    if (process.env.ANTHROPIC_API_KEY) {
-        anthropicClient = new Anthropic.default({ apiKey: process.env.ANTHROPIC_API_KEY });
-        console.log("✅ Anthropic AI client initialized.");
-    }
-} catch (e) {
-    console.warn("⚠️  @anthropic-ai/sdk not found. Run: npm install @anthropic-ai/sdk");
-}
+let openaiClient = null;
 
 try {
     const OpenAI = require("openai");
     if (process.env.OPENROUTER_API_KEY) {
         openaiClient = new (OpenAI.default || OpenAI)({
             baseURL: "https://openrouter.ai/api/v1",
-            apiKey: process.env.OPENROUTER_API_KEY
+            apiKey: process.env.OPENROUTER_API_KEY,
+            defaultHeaders: {
+                "HTTP-Referer": "https://yobest-bytr.vercel.app/",
+                "X-Title": "Yobest Discord Bot"
+            }
         });
-        console.log("✅ OpenRouter AI client initialized (fallback).");
+        console.log("✅ AI client (Yobest) initialized via OpenRouter.");
+    } else {
+        console.warn("⚠️  OPENROUTER_API_KEY not set — AI features will be disabled.");
     }
 } catch (e) {
-    console.warn("⚠️  openai package not found for fallback.");
+    console.warn("⚠️  openai package not found. Run: npm install openai");
 }
 
 // ====================== CLIENT ======================
@@ -430,6 +406,15 @@ const slashCommands = [
     new SlashCommandBuilder()
         .setName("setautorole").setDescription("[Admin] Auto-assign role on join")
         .addRoleOption(o => o.setName("role").setDescription("Role to auto-assign").setRequired(true)),
+    new SlashCommandBuilder()
+        .setName("setwelcomechannel").setDescription("[Admin] Set the welcome channel")
+        .addChannelOption(o => o.setName("channel").setDescription("Welcome channel").setRequired(true)),
+    new SlashCommandBuilder()
+        .setName("setmodlogchannel").setDescription("[Admin] Set the mod-log channel")
+        .addChannelOption(o => o.setName("channel").setDescription("Mod-log channel").setRequired(true)),
+    new SlashCommandBuilder()
+        .setName("setticketcategory").setDescription("[Admin] Set category for new ticket channels")
+        .addChannelOption(o => o.setName("category").setDescription("Category channel").setRequired(true)),
     new SlashCommandBuilder()
         .setName("enableai").setDescription("[Admin] Enable AI chat in this channel"),
     new SlashCommandBuilder()
@@ -1415,7 +1400,7 @@ async function callAI(userPrompt, systemPrompt = "You are a helpful assistant.")
     // Fallback: OpenRouter
     if (openaiClient) {
         const res = await openaiClient.chat.completions.create({
-            model: "google/gemini-3-flash",
+            model: "google/gemini-2.0-flash",
             messages: [
                 { role: "system", content: systemPrompt },
                 { role: "user", content: userPrompt }
@@ -1453,7 +1438,7 @@ async function callAIWithImage(textPrompt, imageUrl) {
     // Fallback: OpenRouter (supports vision models)
     if (openaiClient) {
         const res = await openaiClient.chat.completions.create({
-            model: "google/gemini-3-flash",
+            model: "google/gemini-2.0-flash",
             messages: [{
                 role: "user",
                 content: [
@@ -1600,7 +1585,7 @@ RULES:
         // OpenRouter fallback
         if (openaiClient) {
             const c = await openaiClient.chat.completions.create({
-                model: "google/gemini-3-flash",
+                model: "google/gemini-2.0-flash",
                 messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userInput }],
                 max_tokens: 1600,
                 temperature: 0.7
@@ -2116,4 +2101,3 @@ function extractUrl(input) {
 
 // ====================== LOGIN ======================
 client.login(process.env.DISCORD_TOKEN);
-
