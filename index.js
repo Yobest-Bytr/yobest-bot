@@ -10,7 +10,7 @@
  *     runStartupSelfTest, buildStatsEmbed, buildHelpEmbed).
  *
  *  🔥 CRITICAL FIX: AI now uses OpenRouter ONLY (OPENROUTER_API_KEY).
- *     Model: google/gemini-2.0-flash — hidden from users, shown as "Yobest".
+ *     Model: google/gemini-3.5-flash — hidden from users, shown as "Yobest".
  *
  *  🔥 CRITICAL FIX: Bad messages now truly deleted — safeDelete no
  *     longer uses the broken .deletable cache check; calls
@@ -50,10 +50,10 @@ const {
 
 // ====================== AI CLIENT SETUP ======================
 // Provider : OpenRouter ONLY  →  OPENROUTER_API_KEY
-// Model    : google/gemini-2.0-flash  (NEVER shown to users)
+// Model    : google/gemini-3.5-flash  (NEVER shown to users)
 // Display  : "Yobest"
 const AI_DISPLAY_NAME  = "Yobest";
-const OPENROUTER_MODEL = "google/gemini-2.0-flash";
+const OPENROUTER_MODEL = "google/gemini-3.5-flash";
 
 let openaiClient = null;
 
