@@ -1415,7 +1415,7 @@ async function callAI(userPrompt, systemPrompt = "You are a helpful assistant.")
     // Fallback: OpenRouter
     if (openaiClient) {
         const res = await openaiClient.chat.completions.create({
-            model: "google/gemini-2.0-flash",
+            model: "google/gemini-3-flash",
             messages: [
                 { role: "system", content: systemPrompt },
                 { role: "user", content: userPrompt }
@@ -1453,7 +1453,7 @@ async function callAIWithImage(textPrompt, imageUrl) {
     // Fallback: OpenRouter (supports vision models)
     if (openaiClient) {
         const res = await openaiClient.chat.completions.create({
-            model: "google/gemini-2.0-flash",
+            model: "google/gemini-3-flash",
             messages: [{
                 role: "user",
                 content: [
@@ -1600,7 +1600,7 @@ RULES:
         // OpenRouter fallback
         if (openaiClient) {
             const c = await openaiClient.chat.completions.create({
-                model: "google/gemini-2.0-flash",
+                model: "google/gemini-3-flash",
                 messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userInput }],
                 max_tokens: 1600,
                 temperature: 0.7
@@ -2116,3 +2116,4 @@ function extractUrl(input) {
 
 // ====================== LOGIN ======================
 client.login(process.env.DISCORD_TOKEN);
+
