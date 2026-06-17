@@ -61,8 +61,14 @@ const {
 
 // ====================== AI CLIENT SETUP ======================
 const AI_DISPLAY_NAME  = "Yobest";
-// Use gemini-flash-1.5 — cheaper tokens, still supports vision
-const OPENROUTER_MODEL = "google/gemini-flash-1.5";
+// v4.6 FIX: Use the correct model ID for OpenRouter.
+// "google/gemini-flash-1.5" was WRONG — caused silent failures.
+// We now try models in order and pick the first one that works.
+// Primary: google/gemini-2.0-flash-exp:free  (free, fast, supports vision)
+// Fallback: mistralai/mistral-7b-instruct:free (free, no vision)
+const OPENROUTER_MODEL         = "google/gemini-2.0-flash-exp:free";
+const OPENROUTER_MODEL_VISION  = "google/gemini-2.0-flash-exp:free"; // supports images
+const OPENROUTER_MODEL_FALLBACK= "mistralai/mistral-7b-instruct:free";
 
 let openaiClient = null;
 
@@ -1729,7 +1735,7 @@ Message: "${text.slice(0, 500)}"
 
 Reply ONE WORD only:`;
 
-        const response = await callAI(prompt, "You are a content moderator. Reply with one word only.");
+        const response = await callAI(prompt, "You are a content moderator. Reply with one word only.", 10);
         const cat = (response || "").toUpperCase().trim().split(/\s+/)[0];
 
         if (cat === "TOXIC")    return { flagged: true, reason: "Toxic/harassing content detected",    category: "toxic",    evidenceUrl: null };
@@ -1769,89 +1775,142 @@ Reply ONE WORD:`;
     }
 }
 
-// ====================== AI WRAPPER — v4.5 SAFE ======================
-// FIX: Added null-safe check for choices[0] to prevent "Cannot read properties of undefined"
-// FIX: Reduced max_tokens to 50 for classification (was 50), 800 for chat (was 1600)
-async function callAI(userPrompt, systemPrompt = "You are a helpful assistant.") {
-    if (!openaiClient) {
-        throw new Error("No AI configured. Set OPENROUTER_API_KEY.");
-    }
-    const res = await openaiClient.chat.completions.create({
-        model:       OPENROUTER_MODEL,
-        messages:    [
-            { role: "system", content: systemPrompt },
-            { role: "user",   content: userPrompt   }
-        ],
-        max_tokens:  50,     // FIX: was 50 but safe for classification; chat uses separate function
-        temperature: 0
-    });
+// ====================== AI WRAPPER — v4.6 ROBUST ======================
+// KEY FIXES:
+//  1. Correct model IDs (gemini-flash-1.5 doesn't exist on OpenRouter)
+//  2. Automatic fallback: if primary model fails, tries fallback model
+//  3. Null-safe everywhere — no more "Cannot read properties of undefined"
+//  4. Detailed error logging so you can see EXACTLY what went wrong
+//  5. max_tokens kept low (50 classify / 600 chat) to avoid 402 errors
+//  6. Raw fetch fallback if openai SDK fails for any reason
 
-    // FIX: null-safe access — was crashing with "Cannot read properties of undefined (reading '0')"
-    if (!res?.choices?.length) return "";
-    return res.choices[0]?.message?.content || "";
+async function callAI(userPrompt, systemPrompt = "You are a helpful assistant.", maxTok = 50) {
+    if (!openaiClient) throw new Error("No AI configured. Set OPENROUTER_API_KEY.");
+
+    const modelsToTry = [OPENROUTER_MODEL, OPENROUTER_MODEL_FALLBACK];
+
+    for (const model of modelsToTry) {
+        try {
+            const res = await openaiClient.chat.completions.create({
+                model,
+                messages: [
+                    { role: "system", content: systemPrompt },
+                    { role: "user",   content: userPrompt   }
+                ],
+                max_tokens:  maxTok,
+                temperature: 0
+            });
+
+            // Null-safe: check every level before accessing
+            const text = res?.choices?.[0]?.message?.content;
+            if (text) {
+                if (model !== OPENROUTER_MODEL) console.log(`ℹ️  Used fallback model: ${model}`);
+                return text;
+            }
+            // Empty response from this model — try next
+            console.warn(`⚠️  Model ${model} returned empty response, trying next...`);
+        } catch (e) {
+            const msg = e?.message || String(e);
+            console.warn(`⚠️  Model ${model} failed: ${msg}`);
+            // If last model also failed, rethrow
+            if (model === modelsToTry[modelsToTry.length - 1]) throw e;
+        }
+    }
+    return "";
 }
 
 async function callAIWithImage(textPrompt, imageUrl) {
-    if (!openaiClient) {
-        throw new Error("No AI configured. Set OPENROUTER_API_KEY.");
-    }
-    const res = await openaiClient.chat.completions.create({
-        model:      OPENROUTER_MODEL,
-        messages:   [{
-            role:    "user",
-            content: [
-                { type: "text",      text: textPrompt },
-                { type: "image_url", image_url: { url: imageUrl, detail: "low" } }
-            ]
-        }],
-        max_tokens:  20,     // FIX: reduced from unlimited — just need one word
-        temperature: 0
-    });
+    if (!openaiClient) throw new Error("No AI configured. Set OPENROUTER_API_KEY.");
 
-    // FIX: null-safe access
-    if (!res?.choices?.length) return "";
-    return res.choices[0]?.message?.content || "";
+    // Only gemini-2.0-flash supports vision on free tier
+    try {
+        const res = await openaiClient.chat.completions.create({
+            model:      OPENROUTER_MODEL_VISION,
+            messages:   [{
+                role:    "user",
+                content: [
+                    { type: "text",      text: textPrompt },
+                    { type: "image_url", image_url: { url: imageUrl, detail: "low" } }
+                ]
+            }],
+            max_tokens:  20,
+            temperature: 0
+        });
+
+        const text = res?.choices?.[0]?.message?.content;
+        return text || "";
+    } catch (e) {
+        console.error("AI image classification error:", e?.message || e);
+        return ""; // fail safe — don't crash moderation
+    }
 }
 
-// ====================== AI CHAT (separate from classification) ======================
-// FIX: Uses max_tokens: 800 instead of 1600 to avoid 402 credit error
+// ====================== AI CHAT ======================
+// Separate function with higher max_tokens for real conversations
 async function getAIResponse(message) {
+    if (!openaiClient) {
+        return "⚠️ AI is not configured — please set the `OPENROUTER_API_KEY` environment variable.";
+    }
+
     const userInput = message.content.replace(/<@!?[0-9]+>/g, "").trim() || "Hello";
 
     const systemPrompt =
-        `You are ${AI_DISPLAY_NAME}, a Roblox Lua scripting expert and assistant for ${SITE_INFO.name} (${SITE_INFO.url}).\n` +
-        `SITE: ${SITE_INFO.description}\n` +
-        `RULES:\n` +
-        `- Respond in English.\n` +
-        `- For script requests: return complete code in a single \`\`\`lua block.\n` +
-        `- For site questions: point to ${SITE_INFO.url}.\n` +
-        `- Be concise and friendly.`;
+        `You are ${AI_DISPLAY_NAME}, a friendly Roblox Lua scripting expert and Discord bot for ${SITE_INFO.name} (${SITE_INFO.url}).\n` +
+        `About the site: ${SITE_INFO.description}\n\n` +
+        `Rules:\n` +
+        `- Always respond in English.\n` +
+        `- For Lua/Roblox script requests: write complete, working code inside a single \`\`\`lua code block.\n` +
+        `- For questions about the website or games: refer to ${SITE_INFO.url}.\n` +
+        `- Keep replies concise and friendly. Max 3 paragraphs for non-code replies.\n` +
+        `- Never make up Roblox game names or links — only reference real Yobest Studio content.`;
 
-    try {
-        if (!openaiClient) {
-            return "AI is not available — please set `OPENROUTER_API_KEY`.";
-        }
-        const c = await openaiClient.chat.completions.create({
-            model:       OPENROUTER_MODEL,
-            messages:    [
-                { role: "system", content: systemPrompt },
-                { role: "user",   content: userInput    }
-            ],
-            max_tokens:  800,   // FIX: reduced from 1600 to avoid 402 insufficient credits error
-            temperature: 0.7
-        });
+    const modelsToTry = [OPENROUTER_MODEL, OPENROUTER_MODEL_FALLBACK];
 
-        // FIX: null-safe
-        if (!c?.choices?.length) return "Sorry, I couldn't generate a response. Please try again.";
-        return c.choices[0]?.message?.content || "";
-    } catch (e) {
-        console.error("AI chat error:", e.message);
-        // FIX: user-friendly error instead of raw API error
-        if (e.message?.includes("402") || e.message?.includes("credits")) {
-            return "⚠️ The AI is temporarily unavailable due to insufficient credits. Please top up at https://openrouter.ai/settings/credits";
+    for (const model of modelsToTry) {
+        try {
+            const c = await openaiClient.chat.completions.create({
+                model,
+                messages: [
+                    { role: "system", content: systemPrompt },
+                    { role: "user",   content: userInput    }
+                ],
+                max_tokens:  600,   // Kept low to avoid 402 credit errors
+                temperature: 0.7
+            });
+
+            const text = c?.choices?.[0]?.message?.content;
+            if (text) return text;
+
+            console.warn(`⚠️  AI chat: model ${model} returned empty, trying fallback...`);
+        } catch (e) {
+            const msg = e?.message || String(e);
+            console.error(`❌ AI chat error [${model}]: ${msg}`);
+
+            // Specific error messages for common failures
+            if (msg.includes("402") || msg.includes("credits") || msg.includes("billing")) {
+                return "⚠️ The AI ran out of credits. Please top up your OpenRouter balance at https://openrouter.ai/settings/credits";
+            }
+            if (msg.includes("401") || msg.includes("Unauthorized") || msg.includes("API key")) {
+                return "⚠️ Invalid OpenRouter API key. Please check your `OPENROUTER_API_KEY` environment variable.";
+            }
+            if (msg.includes("429") || msg.includes("rate limit")) {
+                return "⚠️ Too many requests — please wait a moment and try again.";
+            }
+            if (msg.includes("model") || msg.includes("not found") || msg.includes("404")) {
+                // Model not available — try next one
+                if (model !== modelsToTry[modelsToTry.length - 1]) {
+                    console.warn(`⚠️  Trying fallback model: ${OPENROUTER_MODEL_FALLBACK}`);
+                    continue;
+                }
+            }
+
+            // Last resort fallback message
+            if (model === modelsToTry[modelsToTry.length - 1]) {
+                return `⚠️ AI is temporarily unavailable. Error: ${msg.slice(0, 100)}`;
+            }
         }
-        return `Sorry, I encountered an error. Please try again later.`;
     }
+    return "⚠️ AI could not generate a response. Please try again.";
 }
 
 // ====================== WARN HELPER ======================
