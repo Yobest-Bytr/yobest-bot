@@ -66,9 +66,9 @@ const AI_DISPLAY_NAME  = "Yobest";
 // We now try models in order and pick the first one that works.
 // Primary: google/gemini-2.0-flash-exp:free  (free, fast, supports vision)
 // Fallback: mistralai/mistral-7b-instruct:free (free, no vision)
-const OPENROUTER_MODEL         = "google/gemini-2.0-flash-exp:free";
-const OPENROUTER_MODEL_VISION  = "google/gemini-2.0-flash-exp:free"; // supports images
-const OPENROUTER_MODEL_FALLBACK= "mistralai/mistral-7b-instruct:free";
+const OPENROUTER_MODEL         = "google/gemini-3-flash-preview";
+const OPENROUTER_MODEL_VISION  = "google/gemini-3-flash-preview"; // supports images
+const OPENROUTER_MODEL_FALLBACK= "google/gemini-3-flash-preview";
 
 let openaiClient = null;
 
