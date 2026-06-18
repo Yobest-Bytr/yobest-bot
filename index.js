@@ -1,35 +1,23 @@
 /**
- * Yobest_BYTR Discord Bot  ·  v4.6 — AI SERVER BUILDER + SCRIPT ANNOUNCER
- * =========================================================================
- * WHAT'S NEW IN v4.6
- * -------------------------------------------------------------------------
+ * Yobest_BYTR Discord Bot  ·  v4.7 — AI SERVER BUILDER + SCRIPT ANNOUNCER + OWNER CONTROL
+ * ==========================================================================================
+ * WHAT'S NEW IN v4.7
+ * ------------------------------------------------------------------------------------------
  *
- *  🔥 AI model updated to "google/gemini-3-flash-preview" (as requested)
- *  🔥 Automatic model fallback — if primary fails, tries backup model
- *  🔥 All AI calls are null-safe (no more "Cannot read properties of undefined")
- *  🔥 Detailed error messages tell you EXACTLY what went wrong
- *
- *  ✅ NEW: /generate  — AI Server Builder (SetoChan style)
- *     • Single prompt → full server layout (categories, channels, roles)
- *     • Dry-run preview embed before building — confirm or cancel
- *     • Actually creates everything in Discord
- *
- *  ✅ NEW: /agent  — AI Server Agent (ongoing edits via chat)
- *     • "rename #general to #lobby", "add a voice channel called Music"
- *     • "delete the #spam channel", "create role Moderator with blue colour"
- *     • Parses natural language → executes real Discord actions
- *     • Remembers guild context — works conversationally
- *
- *  ✅ NEW: /announcescript title: desc: script:
- *     • Beautiful collapsed script embed (shows first 300 chars)
- *     • 📋 Copy  /  ⬇️ Download  /  👁️ View Full  buttons
- *     • Full script shown ephemerally on "View Full"
- *     • Download delivers script as a file attachment
- *     • Works for any code language (Lua, JS, Python, etc.)
- *
- *  ✅ NEW: /agentclear  — clear your AI agent session
- *  ✅ All v4.5 features fully preserved (auto-mod, scam detection, etc.)
- * =========================================================================
+ *  ✅ FIX: Channel name sanitizer — emoji are now preserved (was stripping all non-a-z0-9)
+ *  ✅ FIX: /announcescript now accepts a `file` attachment option for unlimited-size scripts
+ *          AND always attaches the full script as a downloadable file on the announcement post
+ *  ✅ FIX: AI agent now has FULL Discord permissions:
+ *          - set_channel_permission (ACL overwrites per role)
+ *          - move_channel (set parent category)
+ *          - set_channel_topic / set_channel_nsfw / set_channel_slowmode
+ *          - set_role_color / set_role_hoist / set_role_mentionable / set_role_permissions
+ *  ✅ NEW: /command — Owner natural language control
+ *          - Free-form instruction: "ban @Marco for spam", "give @Alex the Mod role"
+ *          - Resolves @mentions and usernames to real member IDs
+ *          - ALL destructive actions (ban/kick/purge/delete) require a confirm button click
+ *  ✅ All v4.6 features fully preserved
+ * ==========================================================================================
  */
 
 "use strict";
@@ -52,9 +40,9 @@ const {
 
 // ====================== AI CONFIG ======================
 const AI_DISPLAY_NAME     = "Yobest";
-const OPENROUTER_MODEL    = "google/gemini-3-flash-preview";     // Primary (as requested)
-const OPENROUTER_VISION   = "google/gemini-3-flash-preview";     // Vision-capable
-const OPENROUTER_FALLBACK = "google/gemini-3-flash-preview";  // Free fallback
+const OPENROUTER_MODEL    = "google/gemini-3-flash-preview";
+const OPENROUTER_VISION   = "google/gemini-3-flash-preview";
+const OPENROUTER_FALLBACK = "google/gemini-3-flash-preview";
 
 let openaiClient = null;
 try {
@@ -90,25 +78,21 @@ const client = new Client({
 });
 
 // ====================== STATE ======================
-const aiEnabledChannels = new Set();
-const violationCount    = new Map();
-const warnHistory       = new Map();
-const spamTracker       = new Map();
-const xpData            = new Map();
-const customCmds        = new Map();
-const reactionRoles     = new Map();
-const ticketChannels    = new Set();
-const guildSettings     = new Map();
-const snipeData         = new Map();
-
-// AI Agent sessions: "guildId:userId" → conversation history array
-const agentSessions = new Map();
-
-// Pending server-build confirmations: interactionId → { plan, userId, prompt }
-const pendingBuilds = new Map();
-
-// Script store: scriptId → { script, lang, title }
-const scriptStore = new Map();
+const aiEnabledChannels  = new Set();
+const violationCount     = new Map();
+const warnHistory        = new Map();
+const spamTracker        = new Map();
+const xpData             = new Map();
+const customCmds         = new Map();
+const reactionRoles      = new Map();
+const ticketChannels     = new Set();
+const guildSettings      = new Map();
+const snipeData          = new Map();
+const agentSessions      = new Map();   // "guildId:userId" → history[]
+const pendingBuilds       = new Map();   // interactionId → { plan, userId, prompt }
+const pendingAgentActions = new Map();  // token → { actions, userId, guildId }
+const pendingOwnerActions = new Map();  // token → { actions, userId, guildId, channelId }
+const scriptStore        = new Map();   // scriptId → { script, lang, title }
 
 const startTime          = Date.now();
 const WELCOME_CHANNEL_ID = process.env.WELCOME_CHANNEL_ID || null;
@@ -142,6 +126,19 @@ const SITE_INFO = {
 const DANGEROUS_EXTS = /\.(exe|bat|cmd|scr|msi|jar|vbs|ps1|lnk|com|apk|dmg|sh|dll)$/i;
 const SPAM_LIMIT     = 5;
 const SPAM_WINDOW_MS = 60_000;
+const MAX_SCRIPT_FILE_BYTES = 8 * 1024 * 1024; // 8MB
+
+const SCRIPT_FILE_EXT_LANG = {
+    lua: "lua", js: "javascript", mjs: "javascript", ts: "typescript",
+    py: "python", txt: "txt", json: "txt", md: "txt",
+    cs: "txt", cpp: "txt", c: "txt", java: "txt", rb: "txt", php: "txt",
+};
+
+const DESTRUCTIVE_AGENT_ACTIONS = new Set(["delete_channel", "delete_role"]);
+const DESTRUCTIVE_OWNER_ACTIONS = new Set([
+    "ban", "kick", "timeout", "purge", "delete_channel", "delete_role",
+]);
+
 
 // ---- PROFANITY PATTERNS ----
 const PROFANITY_PATTERNS = [
@@ -266,11 +263,12 @@ const QUOTES = [
     { text: "Dream big and dare to fail.", author: "Norman Vaughan" },
 ];
 
-// XP
 const XP_PER_MSG   = () => Math.floor(Math.random() * 10) + 5;
 const XP_FOR_LEVEL = (lvl) => 100 * lvl * lvl;
 
-// ====================== LEVEL SYSTEM ======================
+
+// ====================== HELPERS ======================
+
 function addXP(userId, amount) {
     const data  = xpData.get(userId) || { xp: 0, level: 0 };
     data.xp    += amount;
@@ -284,7 +282,6 @@ function addXP(userId, amount) {
     return { ...data, leveled };
 }
 
-// ====================== GUILD SETTINGS ======================
 function getSettings(guildId) {
     if (!guildSettings.has(guildId)) {
         guildSettings.set(guildId, {
@@ -301,7 +298,6 @@ function getSettings(guildId) {
     return guildSettings.get(guildId);
 }
 
-// ====================== PERMISSION HELPERS ======================
 function getPermLevel(member, guild) {
     if (!member) return "member";
     if (guild.ownerId === member.id)                               return "owner";
@@ -316,9 +312,104 @@ function requireLevel(needed, actual) {
     return order.indexOf(actual) >= order.indexOf(needed);
 }
 
+function parseTime(str) {
+    const m = str?.match(/^(\d+)(s|m|h)$/i);
+    if (!m) return null;
+    const amount = parseInt(m[1]);
+    const unit   = m[2].toLowerCase();
+    const ms     = unit === "h" ? amount * 3_600_000 : unit === "m" ? amount * 60_000 : amount * 1_000;
+    return { ms, amount, unit };
+}
+
+function formatUptime(ms) {
+    const s = Math.floor(ms / 1000)      % 60;
+    const m = Math.floor(ms / 60_000)    % 60;
+    const h = Math.floor(ms / 3_600_000) % 24;
+    const d = Math.floor(ms / 86_400_000);
+    return `${d}d ${h}h ${m}m ${s}s`;
+}
+
+function extractYouTubeId(input) {
+    if (!input) return null;
+    const t = input.trim();
+    if (/^[a-zA-Z0-9_\-]{11}$/.test(t)) return t;
+    const patterns = [
+        /(?:youtube\.com\/watch\?v=)([a-zA-Z0-9_\-]{11})/,
+        /(?:youtu\.be\/)([a-zA-Z0-9_\-]{11})/,
+        /(?:youtube\.com\/shorts\/)([a-zA-Z0-9_\-]{11})/,
+    ];
+    for (const p of patterns) { const m = t.match(p); if (m) return m[1]; }
+    return t;
+}
+
+function extractUrl(input) {
+    if (!input) return null;
+    const t  = input.trim();
+    const md = t.match(/\[.*?\]\((https?:\/\/[^\s)]+)\)/);
+    if (md) return md[1];
+    const url = t.match(/https?:\/\/\S+/);
+    if (url) return url[0];
+    return t;
+}
+
+function addWarning(userId, reason, by) {
+    const w = warnHistory.get(userId) || [];
+    w.push({ reason, ts: Date.now(), by });
+    warnHistory.set(userId, w);
+    return w;
+}
+
+function buildXPBar(current, needed) {
+    const pct    = Math.min(current / needed, 1);
+    const filled = Math.round(pct * 20);
+    return `\`[${"█".repeat(filled)}${"░".repeat(20 - filled)}]\` ${Math.round(pct * 100)}%`;
+}
+
+function splitCode(code, max) {
+    if (code.length <= max) return [code];
+    const lines  = code.split("\n");
+    const chunks = [];
+    let cur      = "";
+    for (const line of lines) {
+        if ((cur + line + "\n").length > max) { chunks.push(cur); cur = ""; }
+        cur += line + "\n";
+    }
+    if (cur) chunks.push(cur);
+    return chunks;
+}
+
+/**
+ * v4.7 FIX — emoji-safe channel name sanitizer.
+ * v4.6 was too aggressive: stripped all non a-z0-9-hyphen (wiping emoji entirely).
+ * Discord's real restrictions: no spaces (use hyphens), no backticks/zero-width chars,
+ * max 100 chars. Emoji and unicode letters are allowed and preserved.
+ */
+function sanitizeChannelName(raw) {
+    if (!raw) return "new-channel";
+    let name = String(raw).trim();
+    name = name.replace(/[\s_]+/g, "-");
+    name = name.replace(/[`"'\u200B-\u200D\uFEFF\x00-\x1F]/g, "");
+    name = name.replace(/-{2,}/g, "-").replace(/^-+|-+$/g, "");
+    name = name.replace(/[A-Z]/g, (c) => c.toLowerCase());
+    if (name.length > 100) name = name.slice(0, 100);
+    return name || "new-channel";
+}
+
+function buildPermissionOverwriteObject(allowList = [], denyList = []) {
+    const obj = {};
+    for (const key of allowList) if (PermissionFlagsBits[key] !== undefined) obj[key] = true;
+    for (const key of denyList)  if (PermissionFlagsBits[key] !== undefined) obj[key] = false;
+    return obj;
+}
+
+function buildPermissionsBitfieldArray(keys = []) {
+    return keys.filter(k => PermissionFlagsBits[k] !== undefined);
+}
+
+
 // ====================== SLASH COMMANDS ======================
 const slashCommands = [
-    // --- PUBLIC ---
+    // PUBLIC
     new SlashCommandBuilder().setName("ping").setDescription("Check bot latency"),
     new SlashCommandBuilder().setName("stats").setDescription("Bot and server stats"),
     new SlashCommandBuilder().setName("serverinfo").setDescription("Info about this server"),
@@ -372,7 +463,7 @@ const slashCommands = [
     new SlashCommandBuilder().setName("snipe").setDescription("Show last deleted message in this channel"),
     new SlashCommandBuilder().setName("help").setDescription("Show all commands"),
 
-    // --- AI SERVER BUILDER ---
+    // AI SERVER BUILDER
     new SlashCommandBuilder()
         .setName("generate")
         .setDescription("[Admin] AI Server Builder — generate a full server layout from a prompt")
@@ -381,22 +472,31 @@ const slashCommands = [
             .setRequired(true)),
     new SlashCommandBuilder()
         .setName("agent")
-        .setDescription("[Admin] AI Server Agent — edit your server with natural language")
+        .setDescription("[Admin] AI Server Agent — edit your server with natural language (full permissions)")
         .addStringOption(o => o.setName("instruction")
-            .setDescription("What to do (e.g. 'rename #general to #lobby' or 'add a role called VIP in gold')")
+            .setDescription("What to do (e.g. 'rename #general to 🎮-gaming, make it read-only for @everyone')")
             .setRequired(true)),
     new SlashCommandBuilder()
         .setName("agentclear")
         .setDescription("[Admin] Clear your AI agent conversation session"),
 
-    // --- SCRIPT ANNOUNCER ---
+    // OWNER NATURAL LANGUAGE CONTROL
+    new SlashCommandBuilder()
+        .setName("command")
+        .setDescription("[Owner] Talk to the bot in plain language — ban/kick/role/message/etc")
+        .addStringOption(o => o.setName("instruction")
+            .setDescription("e.g. 'ban @Marco for spamming' or 'give @Alex the Moderator role'")
+            .setRequired(true)),
+
+    // SCRIPT ANNOUNCER
     new SlashCommandBuilder()
         .setName("announcescript")
-        .setDescription("[Admin] Post a beautiful script announcement with copy/download buttons")
+        .setDescription("[Admin] Post a script announcement with copy/download buttons")
         .addStringOption(o => o.setName("title").setDescription("Title of the script/update").setRequired(true))
         .addStringOption(o => o.setName("desc").setDescription("Description of what the script does").setRequired(true))
-        .addStringOption(o => o.setName("script").setDescription("Paste your full script here").setRequired(true))
-        .addStringOption(o => o.setName("language").setDescription("Script language (default: lua)").setRequired(false)
+        .addStringOption(o => o.setName("script").setDescription("Paste script here (for short scripts — use 'file' for large ones)").setRequired(false))
+        .addAttachmentOption(o => o.setName("file").setDescription("Upload script as a file (recommended for large scripts — no size limit)").setRequired(false))
+        .addStringOption(o => o.setName("language").setDescription("Script language (default: lua; auto-detected from file extension)").setRequired(false)
             .addChoices(
                 { name: "Lua",        value: "lua"        },
                 { name: "JavaScript", value: "javascript" },
@@ -407,7 +507,7 @@ const slashCommands = [
         .addStringOption(o => o.setName("video").setDescription("YouTube video ID or URL (optional)").setRequired(false))
         .addStringOption(o => o.setName("download").setDescription("Extra download link (optional)").setRequired(false)),
 
-    // --- MOD+ ---
+    // MOD+
     new SlashCommandBuilder()
         .setName("warn").setDescription("[Mod] Warn a user")
         .addUserOption(o => o.setName("user").setDescription("User to warn").setRequired(true))
@@ -439,7 +539,7 @@ const slashCommands = [
         .addUserOption(o => o.setName("user").setDescription("Target user").setRequired(true))
         .addStringOption(o => o.setName("nickname").setDescription("New nickname (leave blank to reset)")),
 
-    // --- ADMIN+ ---
+    // ADMIN+
     new SlashCommandBuilder()
         .setName("ban").setDescription("[Admin] Ban a user")
         .addUserOption(o => o.setName("user").setDescription("User to ban").setRequired(true))
@@ -504,11 +604,12 @@ const slashCommands = [
         .setName("clearxp").setDescription("[Admin] Reset XP for a user")
         .addUserOption(o => o.setName("user").setDescription("Target user").setRequired(true)),
 
-    // --- OWNER ---
+    // OWNER
     new SlashCommandBuilder().setName("scanandclean").setDescription("[Owner] Scan + clean last 100 messages"),
     new SlashCommandBuilder().setName("testautomod").setDescription("[Owner] Test the auto-mod pipeline"),
     new SlashCommandBuilder().setName("aitest").setDescription("[Owner] Test AI connection"),
 ].map(cmd => cmd.toJSON());
+
 
 // ====================== REGISTER SLASH COMMANDS ======================
 async function registerSlashCommands() {
@@ -529,8 +630,8 @@ async function registerSlashCommands() {
 
 // ====================== READY ======================
 client.once("ready", async () => {
-    console.log(`✅ Yobest_BYTR Bot v4.6 Online — ${client.user.tag}`);
-    client.user.setActivity("🛡️ Protecting the server | v4.6", { type: 3 });
+    console.log(`✅ Yobest_BYTR Bot v4.7 Online — ${client.user.tag}`);
+    client.user.setActivity("🛡️ Protecting the server | v4.7", { type: 3 });
     await registerSlashCommands();
     await runStartupSelfTest();
 });
@@ -545,26 +646,27 @@ async function runStartupSelfTest() {
         }
         if (!ch) return;
         const embed = new EmbedBuilder()
-            .setTitle("✅ Yobest Bot v4.6 — Online")
+            .setTitle("✅ Yobest Bot v4.7 — Online")
             .setColor(0x00FFAA)
-            .setDescription("v4.6 — AI Server Builder, Script Announcer, Agent edits. Model: " + OPENROUTER_MODEL)
+            .setDescription("v4.7 — Full agent permissions, owner /command, emoji channel names, large-script support.")
             .addFields(
-                { name: "🛡️ Auto-Mod",    value: "✅ Instant regex + AI vision",                   inline: false },
-                { name: "🤬 Profanity",    value: `✅ ${PROFANITY_PATTERNS.length} patterns`,        inline: true  },
-                { name: "📝 Scam Phrases", value: `✅ ${SCAM_PHRASES.length} patterns`,             inline: true  },
-                { name: "🔗 Scam Domains", value: `✅ ${SCAM_DOMAINS.length} patterns`,             inline: true  },
-                { name: "🏗️ AI Builder",   value: "✅ /generate — full server from one prompt",     inline: false },
-                { name: "🤖 AI Agent",     value: "✅ /agent — edit server with natural language",  inline: true  },
-                { name: "📜 Script Posts", value: "✅ /announcescript — copy/download buttons",     inline: true  },
-                { name: "🧠 AI Model",     value: OPENROUTER_MODEL,                                  inline: false },
+                { name: "🛡️ Auto-Mod",        value: "✅ Instant regex + AI vision", inline: false },
+                { name: "🤬 Profanity",        value: `✅ ${PROFANITY_PATTERNS.length} patterns`, inline: true },
+                { name: "📝 Scam Phrases",     value: `✅ ${SCAM_PHRASES.length} patterns`, inline: true },
+                { name: "🔗 Scam Domains",     value: `✅ ${SCAM_DOMAINS.length} patterns`, inline: true },
+                { name: "🏗️ AI Builder",       value: "✅ /generate", inline: false },
+                { name: "🤖 AI Agent",         value: "✅ /agent — full ACL + role permissions", inline: true },
+                { name: "👑 Owner Control",    value: "✅ /command — plain language, confirm-gated", inline: true },
+                { name: "📜 Script Announcer", value: "✅ /announcescript — file upload supported", inline: false },
+                { name: "🧠 AI Model",         value: OPENROUTER_MODEL, inline: false },
             )
-            .setFooter({ text: "Yobest_BYTR Bot v4.6" })
+            .setFooter({ text: "Yobest_BYTR Bot v4.7" })
             .setTimestamp();
         await ch.send({ embeds: [embed] });
     } catch (e) { console.error("Startup self-test error:", e); }
 }
 
-// ====================== WELCOME ======================
+// ====================== EVENTS ======================
 client.on("guildMemberAdd", async (member) => {
     try {
         const s = getSettings(member.guild.id);
@@ -593,7 +695,6 @@ client.on("guildMemberAdd", async (member) => {
     } catch (e) { console.error("Welcome error:", e); }
 });
 
-// ====================== GOODBYE ======================
 client.on("guildMemberRemove", async (member) => {
     try {
         const s = getSettings(member.guild.id);
@@ -616,7 +717,6 @@ client.on("guildMemberRemove", async (member) => {
     } catch (e) { console.error("Goodbye error:", e); }
 });
 
-// ====================== SNIPE TRACKER ======================
 client.on("messageDelete", (message) => {
     if (message.author?.bot) return;
     if (!message.content && !message.attachments.size) return;
@@ -628,7 +728,6 @@ client.on("messageDelete", (message) => {
     });
 });
 
-// ====================== REACTION ROLES ======================
 client.on("messageReactionAdd", async (reaction, user) => {
     if (user.bot) return;
     const key = `${reaction.message.guildId}:${reaction.message.id}:${reaction.emoji.toString()}`;
@@ -653,16 +752,12 @@ client.on("messageReactionRemove", async (reaction, user) => {
     } catch {}
 });
 
+
 // ═══════════════════════════════════════════════════════════════
 //  SLASH COMMAND HANDLER
 // ═══════════════════════════════════════════════════════════════
 client.on("interactionCreate", async (interaction) => {
-    // ---- Button interactions ----
-    if (interaction.isButton()) {
-        await handleButtonInteraction(interaction);
-        return;
-    }
-
+    if (interaction.isButton()) { await handleButtonInteraction(interaction); return; }
     if (!interaction.isChatInputCommand()) return;
 
     const { commandName, member, guild } = interaction;
@@ -793,105 +888,139 @@ client.on("interactionCreate", async (interaction) => {
         }
         if (commandName === "help") return reply({ embeds: [buildHelpEmbed(permLevel)] });
 
-        // ================================================================
-        //  AI SERVER BUILDER — /generate
-        // ================================================================
+        // ---- AI SERVER BUILDER ----
         if (commandName === "generate") {
             if (!requireLevel("admin", permLevel)) return replyErr("You need Admin or higher.");
             if (!openaiClient) return replyErr("AI is not configured. Set `OPENROUTER_API_KEY`.");
             await interaction.deferReply();
-
             const prompt = interaction.options.getString("prompt");
-            await reply(`🏗️ **AI Server Builder** is generating a layout for:\n> *${prompt}*\n\n⏳ Designing your server...`);
-
+            await reply(`🏗️ **AI Server Builder** generating layout for:\n> *${prompt}*\n\n⏳ Working...`);
             let plan;
-            try {
-                plan = await generateServerPlan(prompt);
-            } catch (e) {
-                return reply(`❌ AI failed to generate a plan: ${e.message}`);
-            }
-
+            try { plan = await generateServerPlan(prompt); }
+            catch (e) { return reply(`❌ AI failed: ${e.message}`); }
             const previewEmbed = buildServerPlanEmbed(plan, prompt);
             const confirmRow   = new ActionRowBuilder().addComponents(
                 new ButtonBuilder().setCustomId(`build_confirm_${interaction.id}`).setLabel("✅ Build It").setStyle(ButtonStyle.Success),
                 new ButtonBuilder().setCustomId(`build_cancel_${interaction.id}`).setLabel("❌ Cancel").setStyle(ButtonStyle.Danger),
             );
-
             pendingBuilds.set(interaction.id, { plan, userId: member.id, prompt });
-            // Auto-expire after 5 minutes
             setTimeout(() => pendingBuilds.delete(interaction.id), 300_000);
-
             return reply({ content: "**📋 Preview — Does this look good?**", embeds: [previewEmbed], components: [confirmRow] });
         }
 
-        // ================================================================
-        //  AI SERVER AGENT — /agent
-        // ================================================================
+        // ---- AI SERVER AGENT ----
         if (commandName === "agent") {
             if (!requireLevel("admin", permLevel)) return replyErr("You need Admin or higher.");
             if (!openaiClient) return replyErr("AI is not configured. Set `OPENROUTER_API_KEY`.");
             await interaction.deferReply();
-
             const instruction = interaction.options.getString("instruction");
             const sessionKey  = `${guild.id}:${member.id}`;
             const history     = agentSessions.get(sessionKey) || [];
             history.push({ role: "user", content: instruction });
-
             const ctx = buildGuildContext(guild);
-
             let aiResponse;
-            try {
-                aiResponse = await runAgentTurn(ctx, history);
-            } catch (e) {
-                return reply(`❌ Agent error: ${e.message}`);
-            }
-
+            try { aiResponse = await runAgentTurn(ctx, history); }
+            catch (e) { return reply(`❌ Agent error: ${e.message}`); }
             history.push({ role: "assistant", content: aiResponse.message });
-            // Keep last 20 turns to avoid token overflow
             if (history.length > 20) history.splice(0, history.length - 20);
             agentSessions.set(sessionKey, history);
 
-            const results = await executeAgentActions(aiResponse.actions || [], guild, interaction.channel);
+            const allActions  = aiResponse.actions || [];
+            const destructive = allActions.filter(a => DESTRUCTIVE_AGENT_ACTIONS.has(a.type));
+            const safeActions = allActions.filter(a => !DESTRUCTIVE_AGENT_ACTIONS.has(a.type));
+            const results     = await executeAgentActions(safeActions, guild);
 
             const embed = new EmbedBuilder()
-                .setTitle("🤖 AI Agent Response")
-                .setColor(0x5865F2)
+                .setTitle("🤖 AI Agent Response").setColor(0x5865F2)
                 .setDescription(aiResponse.message)
-                .setFooter({ text: "Use /agentclear to reset the conversation" })
-                .setTimestamp();
+                .setFooter({ text: "Use /agentclear to reset" }).setTimestamp();
+            if (results.length) embed.addFields({ name: "✅ Actions Taken", value: results.map(r => `• ${r}`).join("\n").slice(0, 1024) });
 
-            if (results.length) {
-                embed.addFields({ name: "✅ Actions Taken", value: results.map(r => `• ${r}`).join("\n").slice(0, 1024) });
+            const components = [];
+            if (destructive.length) {
+                const token = `${interaction.id}`;
+                pendingAgentActions.set(token, { actions: destructive, userId: member.id, guildId: guild.id });
+                setTimeout(() => pendingAgentActions.delete(token), 300_000);
+                embed.addFields({ name: "⚠️ Needs Confirmation (destructive)", value: destructive.map(a => `• ${describeAgentAction(a, guild)}`).join("\n").slice(0, 1024) });
+                components.push(new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setCustomId(`agent_confirm_${token}`).setLabel("✅ Confirm").setStyle(ButtonStyle.Danger),
+                    new ButtonBuilder().setCustomId(`agent_cancel_${token}`).setLabel("❌ Cancel").setStyle(ButtonStyle.Secondary),
+                ));
             }
-
-            return reply({ embeds: [embed] });
+            return reply({ embeds: [embed], components });
         }
 
         if (commandName === "agentclear") {
             if (!requireLevel("admin", permLevel)) return replyErr("You need Admin or higher.");
             agentSessions.delete(`${guild.id}:${member.id}`);
-            return reply("✅ Agent session cleared. Starting fresh next time.", true);
+            return reply("✅ Agent session cleared.", true);
         }
 
-        // ================================================================
-        //  SCRIPT ANNOUNCER — /announcescript
-        // ================================================================
+        // ---- OWNER NATURAL LANGUAGE CONTROL ----
+        if (commandName === "command") {
+            if (guild.ownerId !== member.id) return replyErr("This command is restricted to the server owner.");
+            if (!openaiClient) return replyErr("AI is not configured. Set `OPENROUTER_API_KEY`.");
+            await interaction.deferReply();
+            const instruction = interaction.options.getString("instruction");
+            let parsed;
+            try { parsed = await runOwnerCommandTurn(instruction, guild); }
+            catch (e) { return reply(`❌ Could not parse instruction: ${e.message}`); }
+
+            const destructive = (parsed.actions || []).filter(a => DESTRUCTIVE_OWNER_ACTIONS.has(a.type));
+            const safeActions = (parsed.actions || []).filter(a => !DESTRUCTIVE_OWNER_ACTIONS.has(a.type));
+            const results     = await executeOwnerActions(safeActions, guild, interaction.channel);
+
+            const embed = new EmbedBuilder()
+                .setTitle("👑 Owner Command").setColor(0xF1C40F)
+                .setDescription(parsed.message || "Done.").setTimestamp();
+            if (results.length) embed.addFields({ name: "✅ Done", value: results.map(r => `• ${r}`).join("\n").slice(0, 1024) });
+
+            const components = [];
+            if (destructive.length) {
+                const token = `${interaction.id}`;
+                pendingOwnerActions.set(token, { actions: destructive, userId: member.id, guildId: guild.id, channelId: interaction.channel.id });
+                setTimeout(() => pendingOwnerActions.delete(token), 300_000);
+                embed.addFields({ name: "⚠️ Requires Confirmation", value: destructive.map(a => `• ${describeOwnerAction(a, guild)}`).join("\n").slice(0, 1024) });
+                components.push(new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setCustomId(`owner_confirm_${token}`).setLabel("✅ Confirm").setStyle(ButtonStyle.Danger),
+                    new ButtonBuilder().setCustomId(`owner_cancel_${token}`).setLabel("❌ Cancel").setStyle(ButtonStyle.Secondary),
+                ));
+            }
+            return reply({ embeds: [embed], components });
+        }
+
+        // ---- SCRIPT ANNOUNCER ----
         if (commandName === "announcescript") {
             if (!requireLevel("admin", permLevel)) return replyErr("You need Admin or higher.");
             await interaction.deferReply({ ephemeral: true });
+            const title     = interaction.options.getString("title");
+            const desc      = interaction.options.getString("desc");
+            const scriptStr = interaction.options.getString("script");
+            const file       = interaction.options.getAttachment("file");
+            let   lang       = interaction.options.getString("language") || "lua";
+            const ytRaw      = interaction.options.getString("video");
+            const dlLink     = interaction.options.getString("download");
+            const ytId       = ytRaw ? extractYouTubeId(ytRaw) : null;
 
-            const title  = interaction.options.getString("title");
-            const desc   = interaction.options.getString("desc");
-            const script = interaction.options.getString("script");
-            const lang   = interaction.options.getString("language") || "lua";
-            const ytRaw  = interaction.options.getString("video");
-            const dlLink = interaction.options.getString("download");
-            const ytId   = ytRaw ? extractYouTubeId(ytRaw) : null;
+            if (!scriptStr && !file) return reply("❌ Provide either `script` (text) or `file` (attachment) — at least one is required.", true);
 
-            await postScriptAnnouncement(interaction.channel, {
-                title, desc, script, lang, ytId, dlLink, authorTag: member.user.tag,
-            });
+            let script;
+            if (file) {
+                if (file.size > MAX_SCRIPT_FILE_BYTES)
+                    return reply(`❌ File too large (${(file.size / 1024 / 1024).toFixed(1)}MB). Max is ${MAX_SCRIPT_FILE_BYTES / 1024 / 1024}MB.`, true);
+                try {
+                    const res = await fetch(file.url);
+                    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                    script = await res.text();
+                } catch (e) { return reply(`❌ Could not download the attached file: ${e.message}`, true); }
+                const ext = (file.name.split(".").pop() || "").toLowerCase();
+                if (SCRIPT_FILE_EXT_LANG[ext]) lang = SCRIPT_FILE_EXT_LANG[ext];
+            } else {
+                script = scriptStr;
+            }
+            if (!script?.trim()) return reply("❌ The script content was empty.", true);
 
+            await postScriptAnnouncement(interaction.channel, { title, desc, script, lang, ytId, dlLink, authorTag: member.user.tag });
             return reply("✅ Script announcement posted!");
         }
 
@@ -1057,16 +1186,8 @@ client.on("interactionCreate", async (interaction) => {
             getSettings(guild.id).ticketCategoryId = cat.id;
             return reply(`✅ Ticket category set to **${cat.name}**.`);
         }
-        if (commandName === "enableai") {
-            if (!requireLevel("admin", permLevel)) return replyErr("You need Admin or higher.");
-            aiEnabledChannels.add(interaction.channelId);
-            return reply("✅ AI Chat enabled in this channel.");
-        }
-        if (commandName === "disableai") {
-            if (!requireLevel("admin", permLevel)) return replyErr("You need Admin or higher.");
-            aiEnabledChannels.delete(interaction.channelId);
-            return reply("❌ AI Chat disabled.");
-        }
+        if (commandName === "enableai")  { if (!requireLevel("admin", permLevel)) return replyErr("You need Admin or higher."); aiEnabledChannels.add(interaction.channelId); return reply("✅ AI Chat enabled."); }
+        if (commandName === "disableai") { if (!requireLevel("admin", permLevel)) return replyErr("You need Admin or higher."); aiEnabledChannels.delete(interaction.channelId); return reply("❌ AI Chat disabled."); }
         if (commandName === "addcmd") {
             if (!requireLevel("admin", permLevel)) return replyErr("You need Admin or higher.");
             const trigger  = interaction.options.getString("trigger").toLowerCase().replace(/^!/, "");
@@ -1118,7 +1239,7 @@ client.on("interactionCreate", async (interaction) => {
             if (guild.ownerId !== member.id) return replyErr("Owner only.");
             await interaction.deferReply({ ephemeral: true });
             const tests = [
-                { text: "sex",                                               expect: "profanity"   },
+                { text: "sex",                                               expect: "profanity" },
                 { text: "I am giving away $2500 to everyone who registers!", expect: "scam phrase" },
                 { text: "free-nitro-discord.xyz",                            expect: "scam domain" },
                 { text: "withdrawal of $2700 was successfully",              expect: "scam phrase" },
@@ -1137,9 +1258,7 @@ client.on("interactionCreate", async (interaction) => {
             try {
                 const result = await callAI("Reply with exactly: AI is working fine!", "Reply with exactly: AI is working fine!", 20);
                 return reply(`🤖 **${result.trim()}**\nModel: \`${OPENROUTER_MODEL}\``);
-            } catch (e) {
-                return reply(`❌ AI Test FAILED: ${e.message}`);
-            }
+            } catch (e) { return reply(`❌ AI Test FAILED: ${e.message}`); }
         }
 
     } catch (e) {
@@ -1152,101 +1271,124 @@ client.on("interactionCreate", async (interaction) => {
     }
 });
 
+
 // ================================================================
 //  BUTTON INTERACTION HANDLER
 // ================================================================
 async function handleButtonInteraction(interaction) {
     const id = interaction.customId;
 
-    // ---- Server build confirm/cancel ----
     if (id.startsWith("build_confirm_") || id.startsWith("build_cancel_")) {
         const iid     = id.replace("build_confirm_", "").replace("build_cancel_", "");
         const pending = pendingBuilds.get(iid);
-
-        if (!pending) {
-            return interaction.reply({ content: "❌ This build request has expired (5 min limit). Run `/generate` again.", ephemeral: true });
-        }
-        if (interaction.user.id !== pending.userId) {
-            return interaction.reply({ content: "❌ Only the person who ran /generate can confirm this.", ephemeral: true });
-        }
-
+        if (!pending) return interaction.reply({ content: "❌ Build request expired (5 min). Run `/generate` again.", ephemeral: true });
+        if (interaction.user.id !== pending.userId) return interaction.reply({ content: "❌ Only the person who ran /generate can confirm this.", ephemeral: true });
         if (id.startsWith("build_cancel_")) {
             pendingBuilds.delete(iid);
             return interaction.update({ content: "❌ Server build cancelled.", embeds: [], components: [] });
         }
-
-        // Confirm — build the server
         await interaction.update({ content: "🏗️ **Building your server...** Please wait...", embeds: [], components: [] });
         pendingBuilds.delete(iid);
-
         try {
             const results = await buildServerFromPlan(pending.plan, interaction.guild);
-            const embed = new EmbedBuilder()
-                .setTitle("✅ Server Built!")
-                .setColor(0x00FFAA)
-                .setDescription(`Built from prompt: *${pending.prompt}*`)
+            const embed = new EmbedBuilder().setTitle("✅ Server Built!").setColor(0x00FFAA)
+                .setDescription(`Built from: *${pending.prompt}*`)
                 .addFields(
                     { name: "📁 Categories", value: `${results.categories} created`, inline: true },
                     { name: "💬 Channels",   value: `${results.channels} created`,   inline: true },
                     { name: "🎭 Roles",      value: `${results.roles} created`,      inline: true },
-                )
-                .setFooter({ text: "Yobest AI Server Builder" })
-                .setTimestamp();
+                ).setFooter({ text: "Yobest AI Server Builder" }).setTimestamp();
             await interaction.editReply({ content: "", embeds: [embed], components: [] });
-        } catch (e) {
-            await interaction.editReply({ content: `❌ Build failed: ${e.message}`, components: [] });
-        }
+        } catch (e) { await interaction.editReply({ content: `❌ Build failed: ${e.message}`, components: [] }); }
         return;
     }
 
-    // ---- Script announcer: View Full ----
+    if (id.startsWith("agent_confirm_") || id.startsWith("agent_cancel_")) {
+        const token   = id.replace("agent_confirm_", "").replace("agent_cancel_", "");
+        const pending = pendingAgentActions.get(token);
+        if (!pending) return interaction.reply({ content: "❌ Confirmation expired. Re-run `/agent`.", ephemeral: true });
+        if (interaction.user.id !== pending.userId) return interaction.reply({ content: "❌ Only the person who ran /agent can confirm this.", ephemeral: true });
+        if (id.startsWith("agent_cancel_")) {
+            pendingAgentActions.delete(token);
+            return interaction.update({ content: "❌ Destructive actions cancelled.", embeds: interaction.message.embeds, components: [] });
+        }
+        await interaction.update({ content: "⏳ Applying confirmed changes...", components: [] });
+        pendingAgentActions.delete(token);
+        const results = await executeAgentActions(pending.actions, interaction.guild);
+        const embed = new EmbedBuilder().setTitle("✅ Confirmed Actions Applied").setColor(0x00FFAA)
+            .setDescription(results.length ? results.map(r => `• ${r}`).join("\n") : "Nothing to apply.").setTimestamp();
+        await interaction.editReply({ content: "", embeds: [embed] });
+        return;
+    }
+
+    if (id.startsWith("owner_confirm_") || id.startsWith("owner_cancel_")) {
+        const token   = id.replace("owner_confirm_", "").replace("owner_cancel_", "");
+        const pending = pendingOwnerActions.get(token);
+        if (!pending) return interaction.reply({ content: "❌ Confirmation expired. Re-run `/command`.", ephemeral: true });
+        if (interaction.user.id !== pending.userId) return interaction.reply({ content: "❌ Only the server owner can confirm this.", ephemeral: true });
+        if (id.startsWith("owner_cancel_")) {
+            pendingOwnerActions.delete(token);
+            return interaction.update({ content: "❌ Action cancelled.", embeds: interaction.message.embeds, components: [] });
+        }
+        await interaction.update({ content: "⏳ Executing confirmed action(s)...", components: [] });
+        pendingOwnerActions.delete(token);
+        const guild   = interaction.guild;
+        const channel = guild.channels.cache.get(pending.channelId) || interaction.channel;
+        const results = await executeOwnerActions(pending.actions, guild, channel);
+        const embed = new EmbedBuilder().setTitle("✅ Owner Command Executed").setColor(0xF1C40F)
+            .setDescription(results.length ? results.map(r => `• ${r}`).join("\n") : "Nothing to execute.").setTimestamp();
+        await interaction.editReply({ content: "", embeds: [embed] });
+        return;
+    }
+
     if (id.startsWith("script_view_")) {
-        const scriptId = id.replace("script_view_", "");
-        const data     = scriptStore.get(scriptId);
-        if (!data) return interaction.reply({ content: "❌ Script data expired (bot restarted).", ephemeral: true });
-
+        const data = scriptStore.get(id.replace("script_view_", ""));
+        if (!data) return interaction.reply({ content: "❌ Script data expired (bot restarted — use the download attachment on the announcement post instead).", ephemeral: true });
         const chunks = splitCode(data.script, 1900);
-        await interaction.reply({
-            content: `📜 **Full Script** (${chunks.length} part${chunks.length > 1 ? "s" : ""}):\n\`\`\`${data.lang}\n${chunks[0]}\n\`\`\``,
-            ephemeral: true,
-        });
-        for (let i = 1; i < chunks.length; i++) {
+        await interaction.reply({ content: `📜 **Full Script** (${chunks.length} part${chunks.length > 1 ? "s" : ""}):\n\`\`\`${data.lang}\n${chunks[0]}\n\`\`\``, ephemeral: true });
+        for (let i = 1; i < chunks.length; i++)
             await interaction.followUp({ content: `\`\`\`${data.lang}\n${chunks[i]}\n\`\`\``, ephemeral: true });
-        }
         return;
     }
 
-    // ---- Script announcer: Copy ----
     if (id.startsWith("script_copy_")) {
-        const scriptId = id.replace("script_copy_", "");
-        const data     = scriptStore.get(scriptId);
+        const data = scriptStore.get(id.replace("script_copy_", ""));
         if (!data) return interaction.reply({ content: "❌ Script data expired.", ephemeral: true });
-
         const preview = data.script.slice(0, 1800);
         return interaction.reply({
-            content: `📋 **Copy the script below** (select all → Ctrl+C / Cmd+C):\n\`\`\`${data.lang}\n${preview}${data.script.length > 1800 ? "\n... (use 👁️ View Full for the complete script)" : ""}\n\`\`\``,
+            content: `📋 **Copy the script below** (Ctrl+A → Ctrl+C):\n\`\`\`${data.lang}\n${preview}${data.script.length > 1800 ? "\n...(use 👁️ View Full or ⬇️ Download for the complete script)" : ""}\n\`\`\``,
             ephemeral: true,
         });
     }
 
-    // ---- Script announcer: Download ----
     if (id.startsWith("script_download_")) {
-        const scriptId = id.replace("script_download_", "");
-        const data     = scriptStore.get(scriptId);
-        if (!data) return interaction.reply({ content: "❌ Script data expired.", ephemeral: true });
-
+        const data = scriptStore.get(id.replace("script_download_", ""));
+        if (!data) return interaction.reply({ content: "❌ Script data expired — use the file attachment on the original announcement post instead.", ephemeral: true });
         const extMap   = { javascript: "js", python: "py", typescript: "ts", txt: "txt" };
         const ext      = extMap[data.lang] || "lua";
         const filename = `${data.title.replace(/[^a-zA-Z0-9_\-]/g, "_").slice(0, 40)}.${ext}`;
-
-        const attachment = new AttachmentBuilder(Buffer.from(data.script, "utf8"), { name: filename });
         return interaction.reply({
             content: `⬇️ **Download: \`${filename}\`**`,
-            files: [attachment],
+            files:   [new AttachmentBuilder(Buffer.from(data.script, "utf8"), { name: filename })],
             ephemeral: true,
         });
     }
+
+    if (id === "ticket_close_btn") {
+        const permLevel = getPermLevel(interaction.member, interaction.guild);
+        if (!requireLevel("mod", permLevel)) {
+            return interaction.reply({ content: "❌ Only mods+ can close this ticket.", ephemeral: true });
+        }
+        if (!ticketChannels.has(interaction.channelId)) {
+            return interaction.reply({ content: "❌ Not a ticket channel.", ephemeral: true });
+        }
+        await interaction.reply("🔒 Closing ticket in 3 seconds...");
+        ticketChannels.delete(interaction.channelId);
+        setTimeout(() => interaction.channel.delete().catch(() => {}), 3000);
+        return;
+    }
 }
+
 
 // ================================================================
 //  POST SCRIPT ANNOUNCEMENT
@@ -1258,70 +1400,56 @@ async function postScriptAnnouncement(channel, { title, desc, script, lang, ytId
     const preview   = script.slice(0, 300);
     const hasMore   = script.length > 300;
     const lineCount = script.split("\n").length;
-    const charCount = script.length;
 
     const embed = new EmbedBuilder()
-        .setTitle(`📜 ${title}`)
-        .setColor(0x5865F2)
-        .setDescription(desc)
+        .setTitle(`📜 ${title}`).setColor(0x5865F2).setDescription(desc)
         .addFields(
-            {
-                name:  "🔍 Script Preview",
-                value: `\`\`\`${lang}\n${preview}${hasMore ? "\n\n... click 👁️ View Full to see the rest" : ""}\n\`\`\``,
-                inline: false,
-            },
-            { name: "📏 Size",     value: `${lineCount} lines · ${charCount} chars`, inline: true },
-            { name: "💻 Language", value: lang.toUpperCase(),                         inline: true },
-            { name: "👤 Author",   value: authorTag,                                  inline: true },
+            { name: "🔍 Script Preview", value: `\`\`\`${lang}\n${preview}${hasMore ? "\n\n... full script attached below ↓" : ""}\n\`\`\``, inline: false },
+            { name: "📏 Size",     value: `${lineCount} lines · ${script.length.toLocaleString()} chars`, inline: true },
+            { name: "💻 Language", value: lang.toUpperCase(), inline: true },
+            { name: "👤 Author",   value: authorTag, inline: true },
         )
-        .setFooter({ text: `${SITE_INFO.name} • Script Release` })
-        .setTimestamp();
+        .setFooter({ text: `${SITE_INFO.name} • Script Release` }).setTimestamp();
 
     if (ytId) {
         embed.setImage(`https://img.youtube.com/vi/${ytId}/maxresdefault.jpg`);
         embed.addFields({ name: "▶️ Video", value: `[Watch on YouTube](https://youtu.be/${ytId})`, inline: true });
     }
 
-    // Row 1: interactive buttons
     const row1 = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-            .setCustomId(`script_view_${scriptId}`)
-            .setLabel("👁️ View Full Script")
-            .setStyle(ButtonStyle.Primary),
-        new ButtonBuilder()
-            .setCustomId(`script_copy_${scriptId}`)
-            .setLabel("📋 Copy Script")
-            .setStyle(ButtonStyle.Secondary),
-        new ButtonBuilder()
-            .setCustomId(`script_download_${scriptId}`)
-            .setLabel("⬇️ Download Script")
-            .setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`script_view_${scriptId}`).setLabel("👁️ View Full Script").setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId(`script_copy_${scriptId}`).setLabel("📋 Copy Script").setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId(`script_download_${scriptId}`).setLabel("⬇️ Download Script").setStyle(ButtonStyle.Success),
     );
 
-    // Row 2: external links (only if any)
     const row2 = new ActionRowBuilder();
     if (ytId)   row2.addComponents(new ButtonBuilder().setLabel("▶️ Watch Video").setStyle(ButtonStyle.Link).setURL(`https://youtu.be/${ytId}`));
-    if (dlLink) row2.addComponents(new ButtonBuilder().setLabel("🔗 Download Link").setStyle(ButtonStyle.Link).setURL(dlLink));
+    if (dlLink) row2.addComponents(new ButtonBuilder().setLabel("🔗 Extra Download").setStyle(ButtonStyle.Link).setURL(dlLink));
     row2.addComponents(new ButtonBuilder().setLabel("🌐 Yobest Studio").setStyle(ButtonStyle.Link).setURL(SITE_INFO.url));
 
     const components = [row1];
     if (row2.components.length > 0) components.push(row2);
 
+    // Always attach the full script as a downloadable file — no size limit (within Discord's
+    // own upload cap), persists in Discord even if the bot restarts and scriptStore is wiped.
+    const extMap   = { javascript: "js", python: "py", typescript: "ts", txt: "txt" };
+    const ext      = extMap[lang] || "lua";
+    const filename = `${title.replace(/[^a-zA-Z0-9_\-]/g, "_").slice(0, 40) || "script"}.${ext}`;
+
     await channel.send({
-        content: "@everyone 📜 **New Script Release!**",
-        embeds:  [embed],
+        content:    "@everyone 📜 **New Script Release!**",
+        embeds:     [embed],
         components,
+        files:      [new AttachmentBuilder(Buffer.from(script, "utf8"), { name: filename })],
     });
 }
 
 // ================================================================
-//  AI SERVER BUILDER — CORE
+//  AI SERVER BUILDER CORE
 // ================================================================
 async function generateServerPlan(prompt) {
-    const systemPrompt = `You are a Discord server architect. Given a description, output a JSON server plan.
-
+    const systemPrompt = `You are a Discord server architect. Output a JSON server plan.
 IMPORTANT: Reply ONLY with raw valid JSON. No markdown, no backticks, no explanation.
-
 Format:
 {
   "serverName": "suggested server name",
@@ -1339,173 +1467,148 @@ Format:
     { "name": "Role Name", "color": "#FF5733" }
   ]
 }
-
 Rules:
-- Channel names: lowercase, hyphens only, no spaces
+- Channel names: hyphens instead of spaces. You may include emoji (e.g. "🎮-gaming" or "🔊-music").
 - Generate 3-6 categories, 2-5 channels each, 3-8 roles
 - Role colors: hex strings`;
 
-    const raw = await callAI(prompt, systemPrompt, 1500);
-
-    // Strip markdown code fences if AI included them
+    const raw     = await callAI(prompt, systemPrompt, 1500);
     const cleaned = raw.replace(/```(?:json)?\n?/g, "").replace(/```/g, "").trim();
-
     let plan;
-    try {
-        plan = JSON.parse(cleaned);
-    } catch {
+    try { plan = JSON.parse(cleaned); }
+    catch {
         const match = cleaned.match(/\{[\s\S]*\}/);
         if (!match) throw new Error("AI did not return valid JSON. Try rephrasing your prompt.");
         plan = JSON.parse(match[0]);
     }
-
-    if (!plan.categories || !Array.isArray(plan.categories)) {
+    if (!plan.categories || !Array.isArray(plan.categories))
         throw new Error("AI returned an invalid plan structure. Please try again.");
-    }
     return plan;
 }
 
 function buildServerPlanEmbed(plan, prompt) {
     const catLines = (plan.categories || []).map(cat => {
-        const channels = (cat.channels || []).map(ch => {
-            const icon = ch.type === "voice" ? "🔊" : "💬";
-            return `  ${icon} #${ch.name}`;
-        }).join("\n");
+        const channels = (cat.channels || []).map(ch => `  ${ch.type === "voice" ? "🔊" : "💬"} #${sanitizeChannelName(ch.name)}`).join("\n");
         return `**📁 ${cat.name}**\n${channels}`;
     }).join("\n\n");
-
     const roleLines = (plan.roles || []).map(r => `🎭 **${r.name}**`).join(" · ");
-
     return new EmbedBuilder()
-        .setTitle(`🏗️ Generated Server: ${plan.serverName || "New Server"}`)
-        .setColor(0x5865F2)
+        .setTitle(`🏗️ Generated Server: ${plan.serverName || "New Server"}`).setColor(0x5865F2)
         .setDescription(plan.description || `Built from: *${prompt}*`)
         .addFields(
-            { name: "📂 Structure", value: catLines.slice(0, 1024) || "None",                                                           inline: false },
-            { name: "🎭 Roles",     value: roleLines.slice(0, 512) || "None",                                                           inline: false },
-            { name: "⚠️ Warning",   value: "This will **add** new channels, categories, and roles.\nYour existing content will NOT be deleted.", inline: false },
+            { name: "📂 Structure", value: catLines.slice(0, 1024) || "None", inline: false },
+            { name: "🎭 Roles",     value: roleLines.slice(0, 512) || "None", inline: false },
+            { name: "⚠️ Warning",   value: "This will **add** new channels, categories, and roles.\nExisting content will NOT be deleted.", inline: false },
         )
-        .setFooter({ text: "Click ✅ Build It to apply · ❌ Cancel to discard" })
-        .setTimestamp();
+        .setFooter({ text: "Click ✅ Build It to apply · ❌ Cancel to discard" }).setTimestamp();
 }
 
 async function buildServerFromPlan(plan, guild) {
     const results = { categories: 0, channels: 0, roles: 0 };
-
-    // Create roles first
     for (const roleDef of (plan.roles || [])) {
         try {
             const color = roleDef.color ? parseInt(roleDef.color.replace("#", ""), 16) : 0x99AAB5;
-            await guild.roles.create({
-                name:   roleDef.name,
-                color:  isNaN(color) ? 0x99AAB5 : color,
-                reason: "Yobest AI Server Builder",
-            });
+            await guild.roles.create({ name: roleDef.name, color: isNaN(color) ? 0x99AAB5 : color, reason: "Yobest AI Server Builder" });
             results.roles++;
         } catch (e) { console.warn(`Could not create role ${roleDef.name}:`, e.message); }
     }
-
-    // Create categories + channels
     for (const catDef of (plan.categories || [])) {
         let category;
         try {
-            category = await guild.channels.create({
-                name:   catDef.name,
-                type:   ChannelType.GuildCategory,
-                reason: "Yobest AI Server Builder",
-            });
+            category = await guild.channels.create({ name: catDef.name, type: ChannelType.GuildCategory, reason: "Yobest AI Server Builder" });
             results.categories++;
         } catch (e) { console.warn(`Could not create category ${catDef.name}:`, e.message); continue; }
-
         for (const chDef of (catDef.channels || [])) {
             try {
                 const chType = chDef.type === "voice" ? ChannelType.GuildVoice : ChannelType.GuildText;
-                const chOpts = {
-                    name:   chDef.name.toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9\-]/g, ""),
-                    type:   chType,
-                    parent: category.id,
-                    reason: "Yobest AI Server Builder",
-                };
+                const chOpts = { name: sanitizeChannelName(chDef.name), type: chType, parent: category.id, reason: "Yobest AI Server Builder" };
                 if (chDef.topic && chType === ChannelType.GuildText) chOpts.topic = chDef.topic;
                 await guild.channels.create(chOpts);
                 results.channels++;
             } catch (e) { console.warn(`Could not create channel ${chDef.name}:`, e.message); }
         }
     }
-
     return results;
 }
 
+
 // ================================================================
-//  AI AGENT — NATURAL LANGUAGE SERVER EDITOR
+//  AI SERVER AGENT (FULL PERMISSIONS)
 // ================================================================
 function buildGuildContext(guild) {
     const channels = [...guild.channels.cache.values()]
-        .filter(c => c.type !== ChannelType.GuildCategory)
-        .slice(0, 30)
-        .map(c => `#${c.name} (${c.type === ChannelType.GuildVoice ? "voice" : "text"}, id:${c.id})`)
-        .join(", ");
-
+        .filter(c => c.type !== ChannelType.GuildCategory).slice(0, 40)
+        .map(c => `#${c.name} (${c.type === ChannelType.GuildVoice ? "voice" : "text"}, id:${c.id}${c.parentId ? `, cat:${c.parentId}` : ""})`).join(", ");
     const categories = [...guild.channels.cache.values()]
-        .filter(c => c.type === ChannelType.GuildCategory)
-        .slice(0, 15)
-        .map(c => `"${c.name}" (id:${c.id})`)
-        .join(", ");
-
+        .filter(c => c.type === ChannelType.GuildCategory).slice(0, 20)
+        .map(c => `"${c.name}" (id:${c.id})`).join(", ");
     const roles = [...guild.roles.cache.values()]
-        .filter(r => r.name !== "@everyone")
-        .slice(0, 20)
-        .map(r => `"${r.name}" (id:${r.id})`)
-        .join(", ");
-
-    return { channels, categories, roles, name: guild.name };
+        .filter(r => r.name !== "@everyone").slice(0, 25)
+        .map(r => `"${r.name}" (id:${r.id})`).join(", ");
+    return { channels, categories, roles, name: guild.name, everyoneId: guild.roles.everyone.id };
 }
 
 async function runAgentTurn(ctx, history) {
-    const systemPrompt = `You are an AI server manager for the Discord server "${ctx.name}".
+    const systemPrompt = `You are an AI server manager with FULL Discord permissions for "${ctx.name}".
+You can create/rename/delete channels and roles, move channels between categories, set channel
+topics/NSFW/slowmode, set per-channel permission overwrites (ACLs) for any role, edit role
+color/hoist/mentionable/permissions, and rename the server itself.
 
-Current server state:
-- Channels: ${ctx.channels || "none"}
-- Categories: ${ctx.categories || "none"}
-- Roles: ${ctx.roles || "none"}
+@everyone role id: "${ctx.everyoneId}"
+Channels: ${ctx.channels || "none"}
+Categories: ${ctx.categories || "none"}
+Roles: ${ctx.roles || "none"}
 
-Respond ONLY with valid JSON in this exact format:
+Respond ONLY with valid JSON:
 {
-  "message": "Human-readable response explaining what you did or will do",
+  "message": "Human-readable explanation of what you're doing",
   "actions": [
-    { "type": "rename_channel", "id": "channel_id", "name": "new-name" },
-    { "type": "delete_channel", "id": "channel_id" },
-    { "type": "create_channel", "name": "channel-name", "channelType": "text", "category_id": "optional", "topic": "optional" },
-    { "type": "rename_role", "id": "role_id", "name": "New Name" },
-    { "type": "delete_role", "id": "role_id" },
-    { "type": "create_role", "name": "Role Name", "color": "#FF5733" },
-    { "type": "create_category", "name": "CATEGORY NAME" },
-    { "type": "rename_server", "name": "New Server Name" }
+    { "type": "rename_channel",        "id": "channel_id", "name": "new-name-with-🎮-emoji-ok" },
+    { "type": "delete_channel",        "id": "channel_id" },
+    { "type": "create_channel",        "name": "🎮-gaming", "channelType": "text", "category_id": "opt", "topic": "opt" },
+    { "type": "move_channel",          "id": "channel_id", "category_id": "cat_id_or_null" },
+    { "type": "set_channel_topic",     "id": "channel_id", "topic": "text" },
+    { "type": "set_channel_nsfw",      "id": "channel_id", "nsfw": true },
+    { "type": "set_channel_slowmode",  "id": "channel_id", "seconds": 10 },
+    { "type": "set_channel_permission","id": "channel_id", "role_id": "role_or_everyone_id", "allow": ["ViewChannel","SendMessages"], "deny": ["MentionEveryone"] },
+    { "type": "rename_role",           "id": "role_id", "name": "New Name" },
+    { "type": "delete_role",           "id": "role_id" },
+    { "type": "create_role",           "name": "Role Name", "color": "#FF5733" },
+    { "type": "set_role_color",        "id": "role_id", "color": "#FF5733" },
+    { "type": "set_role_hoist",        "id": "role_id", "hoist": true },
+    { "type": "set_role_mentionable",  "id": "role_id", "mentionable": true },
+    { "type": "set_role_permissions",  "id": "role_id", "permissions": ["ManageMessages","KickMembers"] },
+    { "type": "create_category",       "name": "CATEGORY NAME" },
+    { "type": "rename_server",         "name": "New Server Name" }
   ]
 }
 
-If no actions needed, set "actions" to [].
-ONLY use IDs that exist in the server state. Reply ONLY with JSON.`;
+Valid permission flag keys: ViewChannel, SendMessages, ManageMessages, ManageChannels, ManageRoles,
+KickMembers, BanMembers, ManageGuild, MentionEveryone, AttachFiles, EmbedLinks, Connect, Speak,
+MuteMembers, ReadMessageHistory, AddReactions, UseApplicationCommands.
+
+Channel names MAY include emoji — just write them naturally (e.g. "🎉-giveaways").
+Use ONLY IDs from the lists above. If no actions needed, use []. Reply ONLY with JSON.`;
 
     const messages = [{ role: "system", content: systemPrompt }, ...history];
-    const raw      = await callAIMessages(messages, 800);
-
-    const cleaned = raw.replace(/```(?:json)?\n?/g, "").replace(/```/g, "").trim();
+    const raw      = await callAIMessages(messages, 1200);
+    const cleaned  = raw.replace(/```(?:json)?\n?/g, "").replace(/```/g, "").trim();
     try {
         const parsed = JSON.parse(cleaned);
-        if (typeof parsed.message !== "string") throw new Error("Missing message");
         if (!Array.isArray(parsed.actions)) parsed.actions = [];
         return parsed;
     } catch {
         const match = cleaned.match(/\{[\s\S]*\}/);
-        if (match) {
-            try {
-                const parsed = JSON.parse(match[0]);
-                if (!Array.isArray(parsed.actions)) parsed.actions = [];
-                return parsed;
-            } catch {}
-        }
+        if (match) { try { const p = JSON.parse(match[0]); if (!Array.isArray(p.actions)) p.actions = []; return p; } catch {} }
         return { message: raw || "I'm not sure how to help with that.", actions: [] };
+    }
+}
+
+function describeAgentAction(action, guild) {
+    switch (action.type) {
+        case "delete_channel": { const ch = guild.channels.cache.get(action.id); return `Delete channel ${ch ? "#" + ch.name : action.id}`; }
+        case "delete_role":    { const r  = guild.roles.cache.get(action.id);     return `Delete role "${r ? r.name : action.id}"`; }
+        default: return action.type;
     }
 }
 
@@ -1516,22 +1619,22 @@ async function executeAgentActions(actions, guild) {
             switch (action.type) {
                 case "rename_channel": {
                     const ch = guild.channels.cache.get(action.id);
-                    if (!ch) { results.push(`⚠️ Channel ID ${action.id} not found`); break; }
+                    if (!ch) { results.push(`⚠️ Channel ${action.id} not found`); break; }
                     const old = ch.name;
-                    await ch.setName(action.name.toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9\-]/g, ""));
-                    results.push(`Renamed #${old} → #${action.name}`);
+                    await ch.setName(sanitizeChannelName(action.name));
+                    results.push(`Renamed #${old} → #${sanitizeChannelName(action.name)}`);
                     break;
                 }
                 case "delete_channel": {
                     const ch = guild.channels.cache.get(action.id);
-                    if (!ch) { results.push(`⚠️ Channel ID ${action.id} not found`); break; }
+                    if (!ch) { results.push(`⚠️ Channel ${action.id} not found`); break; }
                     const name = ch.name;
-                    await ch.delete("AI Agent");
+                    await ch.delete("AI Agent (confirmed)");
                     results.push(`Deleted #${name}`);
                     break;
                 }
                 case "create_channel": {
-                    const chName = (action.name || "new-channel").toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9\-]/g, "");
+                    const chName = sanitizeChannelName(action.name || "new-channel");
                     const chType = action.channelType === "voice" ? ChannelType.GuildVoice : ChannelType.GuildText;
                     const opts   = { name: chName, type: chType, reason: "AI Agent" };
                     if (action.category_id) opts.parent = action.category_id;
@@ -1540,14 +1643,48 @@ async function executeAgentActions(actions, guild) {
                     results.push(`Created ${action.channelType || "text"} channel #${chName}`);
                     break;
                 }
-                case "create_category": {
-                    await guild.channels.create({ name: (action.name || "New Category").toUpperCase(), type: ChannelType.GuildCategory, reason: "AI Agent" });
-                    results.push(`Created category "${action.name}"`);
+                case "move_channel": {
+                    const ch = guild.channels.cache.get(action.id);
+                    if (!ch) { results.push(`⚠️ Channel ${action.id} not found`); break; }
+                    await ch.setParent(action.category_id || null, { lockPermissions: false });
+                    results.push(`Moved #${ch.name} → ${action.category_id ? "new category" : "no category"}`);
+                    break;
+                }
+                case "set_channel_topic": {
+                    const ch = guild.channels.cache.get(action.id);
+                    if (!ch) { results.push(`⚠️ Channel ${action.id} not found`); break; }
+                    await ch.setTopic(action.topic || "");
+                    results.push(`Set topic on #${ch.name}`);
+                    break;
+                }
+                case "set_channel_nsfw": {
+                    const ch = guild.channels.cache.get(action.id);
+                    if (!ch) { results.push(`⚠️ Channel ${action.id} not found`); break; }
+                    await ch.setNSFW(!!action.nsfw);
+                    results.push(`Set NSFW on #${ch.name}: ${!!action.nsfw}`);
+                    break;
+                }
+                case "set_channel_slowmode": {
+                    const ch = guild.channels.cache.get(action.id);
+                    if (!ch) { results.push(`⚠️ Channel ${action.id} not found`); break; }
+                    await ch.setRateLimitPerUser(Math.max(0, Math.min(21600, action.seconds || 0)));
+                    results.push(`Slowmode on #${ch.name}: ${action.seconds || 0}s`);
+                    break;
+                }
+                case "set_channel_permission": {
+                    const ch = guild.channels.cache.get(action.id);
+                    if (!ch) { results.push(`⚠️ Channel ${action.id} not found`); break; }
+                    const roleId = action.role_id || guild.roles.everyone.id;
+                    const overwriteObj = buildPermissionOverwriteObject(action.allow || [], action.deny || []);
+                    if (!Object.keys(overwriteObj).length) { results.push(`⚠️ No valid permission keys for #${ch.name}`); break; }
+                    await ch.permissionOverwrites.edit(roleId, overwriteObj, { reason: "AI Agent" });
+                    const target = roleId === guild.roles.everyone.id ? "@everyone" : (guild.roles.cache.get(roleId)?.name || roleId);
+                    results.push(`Set permissions on #${ch.name} for **${target}**`);
                     break;
                 }
                 case "rename_role": {
                     const role = guild.roles.cache.get(action.id);
-                    if (!role) { results.push(`⚠️ Role ID ${action.id} not found`); break; }
+                    if (!role) { results.push(`⚠️ Role ${action.id} not found`); break; }
                     const old = role.name;
                     await role.setName(action.name);
                     results.push(`Renamed role "${old}" → "${action.name}"`);
@@ -1555,9 +1692,9 @@ async function executeAgentActions(actions, guild) {
                 }
                 case "delete_role": {
                     const role = guild.roles.cache.get(action.id);
-                    if (!role) { results.push(`⚠️ Role ID ${action.id} not found`); break; }
+                    if (!role) { results.push(`⚠️ Role ${action.id} not found`); break; }
                     const name = role.name;
-                    await role.delete("AI Agent");
+                    await role.delete("AI Agent (confirmed)");
                     results.push(`Deleted role "${name}"`);
                     break;
                 }
@@ -1567,24 +1704,237 @@ async function executeAgentActions(actions, guild) {
                     results.push(`Created role "${action.name}"`);
                     break;
                 }
+                case "set_role_color": {
+                    const role = guild.roles.cache.get(action.id);
+                    if (!role) { results.push(`⚠️ Role ${action.id} not found`); break; }
+                    const color = parseInt((action.color || "#99AAB5").replace("#", ""), 16);
+                    await role.setColor(isNaN(color) ? 0x99AAB5 : color);
+                    results.push(`Set color of "${role.name}" to ${action.color}`);
+                    break;
+                }
+                case "set_role_hoist": {
+                    const role = guild.roles.cache.get(action.id);
+                    if (!role) { results.push(`⚠️ Role ${action.id} not found`); break; }
+                    await role.setHoist(!!action.hoist);
+                    results.push(`Set "${role.name}" hoist: ${!!action.hoist}`);
+                    break;
+                }
+                case "set_role_mentionable": {
+                    const role = guild.roles.cache.get(action.id);
+                    if (!role) { results.push(`⚠️ Role ${action.id} not found`); break; }
+                    await role.setMentionable(!!action.mentionable);
+                    results.push(`Set "${role.name}" mentionable: ${!!action.mentionable}`);
+                    break;
+                }
+                case "set_role_permissions": {
+                    const role = guild.roles.cache.get(action.id);
+                    if (!role) { results.push(`⚠️ Role ${action.id} not found`); break; }
+                    const perms = buildPermissionsBitfieldArray(action.permissions || []);
+                    if (!perms.length) { results.push(`⚠️ No valid permission keys for role "${role.name}"`); break; }
+                    await role.setPermissions(perms.map(p => PermissionFlagsBits[p]));
+                    results.push(`Set permissions on "${role.name}": ${perms.join(", ")}`);
+                    break;
+                }
+                case "create_category": {
+                    await guild.channels.create({ name: (action.name || "New Category").toUpperCase(), type: ChannelType.GuildCategory, reason: "AI Agent" });
+                    results.push(`Created category "${action.name}"`);
+                    break;
+                }
                 case "rename_server": {
                     const old = guild.name;
                     await guild.setName(action.name);
                     results.push(`Renamed server: "${old}" → "${action.name}"`);
                     break;
                 }
-                default:
-                    results.push(`⚠️ Unknown action type: ${action.type}`);
+                default: results.push(`⚠️ Unknown action: ${action.type}`);
             }
-        } catch (e) {
-            results.push(`❌ Failed [${action.type}]: ${e.message}`);
-        }
+        } catch (e) { results.push(`❌ Failed [${action.type}]: ${e.message}`); }
     }
     return results;
 }
 
+
 // ================================================================
-//  MESSAGE HANDLER
+//  OWNER NATURAL LANGUAGE CONTROL (/command)
+// ================================================================
+function buildOwnerContext(guild) {
+    const members = [...guild.members.cache.values()].filter(m => !m.user.bot).slice(0, 80)
+        .map(m => `${m.user.username} (id:${m.id}${m.nickname ? `, nick:${m.nickname}` : ""})`).join(", ");
+    const channels = [...guild.channels.cache.values()].filter(c => c.type !== ChannelType.GuildCategory).slice(0, 40)
+        .map(c => `#${c.name} (id:${c.id})`).join(", ");
+    const roles = [...guild.roles.cache.values()].filter(r => r.name !== "@everyone").slice(0, 25)
+        .map(r => `"${r.name}" (id:${r.id})`).join(", ");
+    return { members, channels, roles, name: guild.name };
+}
+
+async function runOwnerCommandTurn(instruction, guild) {
+    const ctx = buildOwnerContext(guild);
+    const systemPrompt = `You are the server owner's personal assistant for "${ctx.name}".
+Resolve free-form instructions into structured actions. Match member names/mentions to IDs below.
+
+Members: ${ctx.members || "none"}
+Channels: ${ctx.channels || "none"}
+Roles: ${ctx.roles || "none"}
+
+Respond ONLY with valid JSON:
+{
+  "message": "What I understood and will do",
+  "actions": [
+    { "type": "ban",            "user_id": "id", "reason": "text" },
+    { "type": "kick",           "user_id": "id", "reason": "text" },
+    { "type": "timeout",        "user_id": "id", "minutes": 10, "reason": "text" },
+    { "type": "warn",           "user_id": "id", "reason": "text" },
+    { "type": "purge",          "channel_id": "id", "count": 20 },
+    { "type": "add_role",       "user_id": "id", "role_id": "id" },
+    { "type": "remove_role",    "user_id": "id", "role_id": "id" },
+    { "type": "set_nickname",   "user_id": "id", "nickname": "text or null to reset" },
+    { "type": "rename_channel", "channel_id": "id", "name": "new-name" },
+    { "type": "delete_channel", "channel_id": "id" },
+    { "type": "delete_role",    "role_id": "id" },
+    { "type": "send_message",   "channel_id": "id", "text": "message text" }
+  ]
+}
+
+If you cannot confidently match a name to a real ID from above, set actions:[] and explain in message.
+Never invent IDs. Reply ONLY with JSON.`;
+
+    const raw     = await callAIMessages([{ role: "system", content: systemPrompt }, { role: "user", content: instruction }], 800);
+    const cleaned = raw.replace(/```(?:json)?\n?/g, "").replace(/```/g, "").trim();
+    try { const p = JSON.parse(cleaned); if (!Array.isArray(p.actions)) p.actions = []; return p; }
+    catch {
+        const match = cleaned.match(/\{[\s\S]*\}/);
+        if (match) { try { const p = JSON.parse(match[0]); if (!Array.isArray(p.actions)) p.actions = []; return p; } catch {} }
+        return { message: raw || "Could not understand that instruction.", actions: [] };
+    }
+}
+
+function describeOwnerAction(action, guild) {
+    const userTag  = (id) => guild.members.cache.get(id)?.user.tag || id;
+    const chName   = (id) => guild.channels.cache.get(id)?.name || id;
+    const roleName = (id) => guild.roles.cache.get(id)?.name || id;
+    switch (action.type) {
+        case "ban":            return `Ban ${userTag(action.user_id)} — ${action.reason || "no reason"}`;
+        case "kick":           return `Kick ${userTag(action.user_id)} — ${action.reason || "no reason"}`;
+        case "timeout":        return `Timeout ${userTag(action.user_id)} for ${action.minutes || 10}m — ${action.reason || "no reason"}`;
+        case "purge":          return `Delete ${action.count || 0} messages in #${chName(action.channel_id)}`;
+        case "delete_channel": return `Delete channel #${chName(action.channel_id)}`;
+        case "delete_role":    return `Delete role "${roleName(action.role_id)}"`;
+        default: return action.type;
+    }
+}
+
+async function executeOwnerActions(actions, guild, channel) {
+    const results = [];
+    for (const action of actions) {
+        try {
+            switch (action.type) {
+                case "ban": {
+                    const member = await guild.members.fetch(action.user_id).catch(() => null);
+                    if (!member) { results.push(`⚠️ Member ${action.user_id} not found`); break; }
+                    const reason = action.reason || "Banned via owner /command";
+                    await member.send(`🔨 You were **banned** from **${guild.name}**.\nReason: **${reason}**`).catch(() => {});
+                    await member.ban({ reason });
+                    results.push(`Banned ${member.user.tag} — ${reason}`);
+                    break;
+                }
+                case "kick": {
+                    const member = await guild.members.fetch(action.user_id).catch(() => null);
+                    if (!member) { results.push(`⚠️ Member ${action.user_id} not found`); break; }
+                    const reason = action.reason || "Kicked via owner /command";
+                    await member.send(`👢 You were **kicked** from **${guild.name}**.\nReason: **${reason}**`).catch(() => {});
+                    await member.kick(reason);
+                    results.push(`Kicked ${member.user.tag} — ${reason}`);
+                    break;
+                }
+                case "timeout": {
+                    const member = await guild.members.fetch(action.user_id).catch(() => null);
+                    if (!member) { results.push(`⚠️ Member ${action.user_id} not found`); break; }
+                    const ms = Math.max(1, Math.min(40320, action.minutes || 10)) * 60_000;
+                    await member.timeout(ms, action.reason || "Timed out via /command");
+                    results.push(`Timed out ${member.user.tag} for ${action.minutes || 10}m`);
+                    break;
+                }
+                case "warn": {
+                    const member = await guild.members.fetch(action.user_id).catch(() => null);
+                    if (!member) { results.push(`⚠️ Member ${action.user_id} not found`); break; }
+                    const reason = action.reason || "Warned via /command";
+                    const warns  = addWarning(member.id, reason, "Server Owner");
+                    await member.send(`⚠️ You were **warned** in **${guild.name}**.\nReason: **${reason}**`).catch(() => {});
+                    results.push(`Warned ${member.user.tag} (#${warns.length}) — ${reason}`);
+                    break;
+                }
+                case "purge": {
+                    const ch = guild.channels.cache.get(action.channel_id) || channel;
+                    if (!ch?.bulkDelete) { results.push(`⚠️ Channel ${action.channel_id} not found`); break; }
+                    const n = Math.max(1, Math.min(100, action.count || 10));
+                    const deleted = await ch.bulkDelete(n, true);
+                    results.push(`Deleted ${deleted.size} messages in #${ch.name}`);
+                    break;
+                }
+                case "add_role": {
+                    const member = await guild.members.fetch(action.user_id).catch(() => null);
+                    const role   = guild.roles.cache.get(action.role_id);
+                    if (!member || !role) { results.push(`⚠️ Member or role not found`); break; }
+                    await member.roles.add(role);
+                    results.push(`Gave "${role.name}" to ${member.user.tag}`);
+                    break;
+                }
+                case "remove_role": {
+                    const member = await guild.members.fetch(action.user_id).catch(() => null);
+                    const role   = guild.roles.cache.get(action.role_id);
+                    if (!member || !role) { results.push(`⚠️ Member or role not found`); break; }
+                    await member.roles.remove(role);
+                    results.push(`Removed "${role.name}" from ${member.user.tag}`);
+                    break;
+                }
+                case "set_nickname": {
+                    const member = await guild.members.fetch(action.user_id).catch(() => null);
+                    if (!member) { results.push(`⚠️ Member ${action.user_id} not found`); break; }
+                    await member.setNickname(action.nickname || null);
+                    results.push(`Set nickname of ${member.user.tag} to ${action.nickname || "(reset)"}`);
+                    break;
+                }
+                case "rename_channel": {
+                    const ch = guild.channels.cache.get(action.channel_id);
+                    if (!ch) { results.push(`⚠️ Channel ${action.channel_id} not found`); break; }
+                    const old = ch.name;
+                    await ch.setName(sanitizeChannelName(action.name));
+                    results.push(`Renamed #${old} → #${sanitizeChannelName(action.name)}`);
+                    break;
+                }
+                case "delete_channel": {
+                    const ch = guild.channels.cache.get(action.channel_id);
+                    if (!ch) { results.push(`⚠️ Channel ${action.channel_id} not found`); break; }
+                    const name = ch.name;
+                    await ch.delete("Owner /command (confirmed)");
+                    results.push(`Deleted #${name}`);
+                    break;
+                }
+                case "delete_role": {
+                    const role = guild.roles.cache.get(action.role_id);
+                    if (!role) { results.push(`⚠️ Role ${action.role_id} not found`); break; }
+                    const name = role.name;
+                    await role.delete("Owner /command (confirmed)");
+                    results.push(`Deleted role "${name}"`);
+                    break;
+                }
+                case "send_message": {
+                    const ch = guild.channels.cache.get(action.channel_id) || channel;
+                    if (!ch?.send) { results.push(`⚠️ Channel ${action.channel_id} not found`); break; }
+                    await ch.send(action.text || "");
+                    results.push(`Sent message in #${ch.name}`);
+                    break;
+                }
+                default: results.push(`⚠️ Unknown action: ${action.type}`);
+            }
+        } catch (e) { results.push(`❌ Failed [${action.type}]: ${e.message}`); }
+    }
+    return results;
+}
+
+
+// ================================================================
+//  MESSAGE HANDLER (prefix commands + auto-mod + XP + AI chat)
 // ================================================================
 client.on("messageCreate", async (message) => {
     if (message.author.bot || !message.guild) return;
@@ -1597,7 +1947,7 @@ client.on("messageCreate", async (message) => {
     const isOwner   = permLevel === "owner";
     const guildId   = message.guild.id;
 
-    // ════ STEP 1 — AUTO-MOD ════
+    // ── STEP 1 — AUTO-MOD ──
     if (!isMod) {
         const spamResult = checkSpam(message.author.id);
         if (spamResult.flagged) {
@@ -1635,12 +1985,11 @@ client.on("messageCreate", async (message) => {
             }
         }
 
-        // AI moderation runs in background
         moderateWithAI(message).catch(() => {});
         if (/https?:\/\//i.test(content)) scheduleEmbedRecheck(message);
     }
 
-    // ════ STEP 2 — XP ════
+    // ── STEP 2 — XP ──
     if (!ticketChannels.has(message.channelId)) {
         const result = addXP(message.author.id, XP_PER_MSG());
         if (result.leveled) {
@@ -1648,7 +1997,7 @@ client.on("messageCreate", async (message) => {
         }
     }
 
-    // ════ STEP 3 — PREFIX COMMANDS ════
+    // ── STEP 3 — PREFIX COMMANDS ──
 
     // OWNER
     if (isOwner) {
@@ -1815,6 +2164,7 @@ client.on("messageCreate", async (message) => {
         }
     }
 });
+
 
 // ================================================================
 //  AUTO-MOD HELPERS
@@ -2028,512 +2378,568 @@ async function getAIResponse(message) {
     return "⚠️ AI could not generate a response. Please try again.";
 }
 
+
 // ================================================================
-//  WARN / TIMEOUT / MOD LOG
+//  WARN ESCALATION + MOD-LOG
 // ================================================================
-function addWarning(userId, reason, by) {
-    const w = warnHistory.get(userId) || [];
-    w.push({ reason, ts: Date.now(), by });
-    warnHistory.set(userId, w);
-    return w;
+async function logToModChannel(guild, embed) {
+    try {
+        const s  = getSettings(guild.id);
+        const id = s.modlogChannelId || MODLOG_CHANNEL_ID;
+        if (!id) return;
+        const ch = guild.channels.cache.get(id);
+        if (!ch?.send) return;
+        await ch.send({ embeds: [embed] }).catch(() => {});
+    } catch {}
 }
 
+/**
+ * Escalating auto-mod punishment:
+ *   1st violation → warning only
+ *   2nd violation → 10 minute timeout
+ *   3rd violation → 1 hour timeout
+ *   4th+ violation → 24 hour timeout
+ * Also records a warning entry and posts a log embed to the mod-log channel.
+ */
 async function applyTimeout(message, reason, category, evidenceUrl) {
-    const userId = message.author.id;
-    const count  = (violationCount.get(userId) || 0) + 1;
-    violationCount.set(userId, count);
-    let actionTaken = "Warned";
     try {
-        if (count >= 3) {
-            await message.member?.timeout(60 * 60 * 1000, reason).catch(() => {});
-            await message.channel.send(`⛔ ${message.author} timed out for **1 hour**. Reason: **${reason}**`).catch(() => {});
-            actionTaken = "Timed out (1h)";
-        } else if (count >= 2) {
-            await message.member?.timeout(10 * 60 * 1000, reason).catch(() => {});
-            await message.channel.send(`⛔ ${message.author} timed out for **10 minutes**. Reason: **${reason}**`).catch(() => {});
-            actionTaken = "Timed out (10m)";
-        } else {
-            await message.channel.send(`⚠️ ${message.author} your message was removed. Reason: **${reason}**`).catch(() => {});
-        }
-    } catch (e) { console.error("Timeout error:", e.message); }
-    await logToModChannel(message, reason, category, actionTaken, count, evidenceUrl);
-}
+        const userId = message.author.id;
+        const guild  = message.guild;
+        const count  = (violationCount.get(userId) || 0) + 1;
+        violationCount.set(userId, count);
 
-async function logToModChannel(message, reason, category, actionTaken, count, evidenceUrl) {
-    const s    = getSettings(message.guild.id);
-    const chId = s.modlogChannelId || MODLOG_CHANNEL_ID;
-    if (!chId) return;
-    try {
-        const ch = message.guild.channels.cache.get(chId);
-        if (!ch) return;
-        const emojis = { language: "🤬", toxic: "☢️", scam: "🎭", phishing: "🎣", nsfw: "🔞", file: "📁", spam: "⚡" };
-        const embed  = new EmbedBuilder()
-            .setTitle(`${emojis[category] || "🛡️"} Auto-Mod: Message Removed`)
+        const warns = addWarning(userId, `[Auto-mod: ${category}] ${reason}`, "AutoMod");
+
+        let action = "Warned";
+        let member = null;
+        try { member = await guild.members.fetch(userId); } catch {}
+
+        if (count >= 2 && member) {
+            const ms =
+                count === 2 ? 10 * 60_000 :
+                count === 3 ? 60 * 60_000 :
+                24 * 60 * 60_000;
+            try {
+                await member.timeout(ms, `Auto-mod (${category}): ${reason}`);
+                action = `Timed out for ${formatUptime(ms)}`;
+            } catch {
+                action = "Warned (timeout failed — check role hierarchy)";
+            }
+        }
+
+        const embed = new EmbedBuilder()
+            .setTitle("🛡️ Auto-Mod Action")
             .setColor(0xFF4444)
             .addFields(
-                { name: "User",       value: `${message.author} (${message.author.id})`, inline: true  },
-                { name: "Channel",    value: `${message.channel}`,                        inline: true  },
-                { name: "Category",   value: category || "unknown",                       inline: true  },
-                { name: "Reason",     value: reason                                                      },
-                { name: "Action",     value: actionTaken,                                 inline: true  },
-                { name: "Violation#", value: `${count}`,                                  inline: true  },
-                { name: "Content",    value: (message.content || "*(attachment)*").slice(0, 1024) },
+                { name: "User",       value: `${message.author.tag} (${userId})`, inline: true },
+                { name: "Category",   value: `\`${category}\``, inline: true },
+                { name: "Violation #", value: `${count}`, inline: true },
+                { name: "Action",     value: action, inline: true },
+                { name: "Reason",     value: reason.slice(0, 1000), inline: false },
+                { name: "Channel",    value: `${message.channel}`, inline: true },
+                { name: "Warnings on file", value: `${warns.length}`, inline: true },
             )
             .setTimestamp();
         if (evidenceUrl) embed.setImage(evidenceUrl);
-        await ch.send({ embeds: [embed] });
-    } catch (e) { console.error("Mod-log error:", e); }
+
+        await logToModChannel(guild, embed);
+    } catch (e) { console.error("applyTimeout error:", e.message); }
 }
 
 // ================================================================
-//  SCAN AND CLEAN
+//  /scanandclean — bulk-scan recent channel history
 // ================================================================
 async function doScanAndClean(channel) {
-    const msgs = await channel.messages.fetch({ limit: 100 });
-    const list = [...msgs.values()].filter(m => !m.author.bot);
     let deleted = 0;
-    const BATCH = 10;
-    for (let i = 0; i < list.length; i += BATCH) {
-        const results = await Promise.allSettled(
-            list.slice(i, i + BATCH).map(async msg => {
-                if (quickTextScan(msg.content || "").flagged) { await safeDelete(msg); return true; }
-                for (const e of msg.embeds) if (scanEmbedText(e).flagged) { await safeDelete(msg); return true; }
-                if (openaiClient) {
-                    const urls = getImageUrls(msg);
-                    if (urls.length) {
-                        const res = await Promise.allSettled(urls.map(u => classifyImageWithAI(u)));
-                        for (const r of res) if (r.status === "fulfilled" && r.value?.flagged) { await safeDelete(msg); return true; }
-                    }
+    try {
+        const fetched  = await channel.messages.fetch({ limit: 100 });
+        const messages = [...fetched.values()].filter(m => !m.author.bot);
+
+        for (const msg of messages) {
+            let flagged = false;
+            let reason  = "";
+
+            const textResult = quickTextScan(msg.content || "");
+            if (textResult.flagged) { flagged = true; reason = textResult.reason; }
+
+            if (!flagged) {
+                for (const embed of msg.embeds) {
+                    const r = scanEmbedText(embed);
+                    if (r.flagged) { flagged = true; reason = r.reason; break; }
                 }
-                return false;
-            })
-        );
-        deleted += results.filter(r => r.status === "fulfilled" && r.value === true).length;
-    }
+            }
+
+            if (!flagged && openaiClient) {
+                const imageUrls = getImageUrls(msg);
+                for (const url of imageUrls) {
+                    const r = await classifyImageWithAI(url).catch(() => ({ flagged: false }));
+                    if (r.flagged) { flagged = true; reason = r.reason; break; }
+                }
+            }
+
+            if (flagged) {
+                await msg.delete().catch(() => {});
+                deleted++;
+                violationCount.set(msg.author.id, (violationCount.get(msg.author.id) || 0) + 1);
+                addWarning(msg.author.id, `[ScanAndClean] ${reason}`, "AutoMod");
+            }
+        }
+
+        if (deleted > 0) {
+            await logToModChannel(channel.guild, new EmbedBuilder()
+                .setTitle("🧹 Scan & Clean Complete")
+                .setColor(0xFF8800)
+                .addFields(
+                    { name: "Channel",         value: `${channel}`, inline: true },
+                    { name: "Messages Scanned", value: `${messages.length}`, inline: true },
+                    { name: "Messages Deleted", value: `${deleted}`, inline: true },
+                )
+                .setTimestamp());
+        }
+    } catch (e) { console.error("doScanAndClean error:", e.message); }
     return deleted;
 }
 
 // ================================================================
-//  ANNOUNCE / GIVEAWAY / POLL / REPORT / REMINDME / BAN / TICKET
+//  ANNOUNCE
 // ================================================================
-async function handleAnnouncePrefix(message, content) {
-    const body = content.replace(/^!announce/i, "").trim();
-    if (!body) return message.reply("❌ Usage:\n```\n!announce\ntitle: Title\ndesc: Description\nvideo: yt_id\ndownload: link\nroblox: link\n```");
-    let title, description, ytId, downloadUrl, robloxUrl;
-    const isNew = /^(title|desc|description)\s*:/im.test(body);
-    if (isNew) {
-        const fields = {};
-        let cur = null;
-        for (const line of body.split("\n").map(l => l.trim()).filter(Boolean)) {
-            const m = line.match(/^(title|desc(?:ription)?|video|youtube|download|roblox)\s*:\s*(.*)$/i);
-            if (m) { cur = m[1].toLowerCase(); if (cur === "description") cur = "desc"; if (cur === "youtube") cur = "video"; fields[cur] = m[2].trim(); }
-            else if (cur) fields[cur] += "\n" + line;
-        }
-        title = fields.title; description = fields.desc;
-        ytId        = fields.video    ? extractYouTubeId(fields.video)  : null;
-        downloadUrl = fields.download ? extractUrl(fields.download)      : null;
-        robloxUrl   = fields.roblox   ? extractUrl(fields.roblox)       : null;
-        if (!title || !description) return message.reply("❌ Need `title:` and `desc:`");
-    } else {
-        const args = body.split("|").map(s => s.trim());
-        if (args.length < 2) return message.reply("❌ Need at least `title|desc`");
-        [title, description, ytId, downloadUrl, robloxUrl] = args;
-        ytId        = ytId        ? extractYouTubeId(ytId)  : null;
-        downloadUrl = downloadUrl ? extractUrl(downloadUrl)  : null;
-        robloxUrl   = robloxUrl   ? extractUrl(robloxUrl)   : null;
-    }
-    await postAnnouncement(message.channel, { title, description, ytId, downloadUrl, robloxUrl }, message.author.tag);
-    return message.reply("✅ Announcement posted!");
-}
-
 async function postAnnouncement(channel, { title, description, ytId, downloadUrl, robloxUrl }, authorTag) {
     const embed = new EmbedBuilder()
-        .setTitle(`🚨 ${title}`).setDescription(description).setColor(0x00FFAA)
-        .setTimestamp().setFooter({ text: `By ${authorTag} • ${SITE_INFO.name}` });
-    if (ytId) { embed.setImage(`https://img.youtube.com/vi/${ytId}/maxresdefault.jpg`); embed.addFields({ name: "▶️ YouTube", value: `[Watch](https://youtu.be/${ytId})`, inline: true }); }
-    const extras = [];
-    if (downloadUrl) extras.push({ name: "⬇️ Download", value: `[Click Here](${downloadUrl})`, inline: true });
-    if (robloxUrl)   extras.push({ name: "🎮 Roblox",   value: `[Play Now](${robloxUrl})`,      inline: true });
-    if (extras.length) embed.addFields(extras);
+        .setTitle(`📢 ${title}`)
+        .setColor(0x00FFAA)
+        .setDescription(description)
+        .setFooter({ text: `Announced by ${authorTag}` })
+        .setTimestamp();
+    if (ytId) embed.setImage(`https://img.youtube.com/vi/${ytId}/maxresdefault.jpg`);
+
     const row = new ActionRowBuilder();
-    if (ytId)        row.addComponents(new ButtonBuilder().setLabel("Watch Video").setStyle(ButtonStyle.Link).setURL(`https://youtu.be/${ytId}`).setEmoji("▶️"));
-    if (downloadUrl) row.addComponents(new ButtonBuilder().setLabel("Download").setStyle(ButtonStyle.Link).setURL(downloadUrl).setEmoji("📥"));
-    if (robloxUrl)   row.addComponents(new ButtonBuilder().setLabel("Play Roblox").setStyle(ButtonStyle.Link).setURL(robloxUrl).setEmoji("🎮"));
-    const payload = { content: "@everyone 🚨 **New Update by BYTR!** 🚨", embeds: [embed] };
+    if (downloadUrl) row.addComponents(new ButtonBuilder().setLabel("⬇️ Download").setStyle(ButtonStyle.Link).setURL(extractUrl(downloadUrl)));
+    if (robloxUrl)   row.addComponents(new ButtonBuilder().setLabel("🎮 Play on Roblox").setStyle(ButtonStyle.Link).setURL(extractUrl(robloxUrl)));
+    if (ytId)         row.addComponents(new ButtonBuilder().setLabel("▶️ Watch Video").setStyle(ButtonStyle.Link).setURL(`https://youtu.be/${ytId}`));
+
+    const payload = { embeds: [embed] };
     if (row.components.length) payload.components = [row];
     await channel.send(payload);
 }
 
-async function handleGiveawayPrefix(message, content) {
-    const parts   = content.replace(/^!giveaway\s+/i, "").split(/\s+/);
-    const timeStr = parts[0];
-    const prize   = parts.slice(1).join(" ");
-    if (!timeStr || !prize) return message.reply("❌ Usage: `!giveaway 10m Cool Prize`");
-    const res = parseTime(timeStr);
-    if (!res) return message.reply("❌ Format: `30s`, `5m`, `1h`");
-    await runGiveaway(message.channel, res.ms, prize, message.author.tag);
-    return message.reply(`✅ Giveaway started! Drawing in **${timeStr}**.`);
-}
-
-async function runGiveaway(channel, ms, prize, hostTag) {
-    const embed = new EmbedBuilder()
-        .setTitle("🎉 GIVEAWAY!").setColor(0xFFD700)
-        .setDescription(`**Prize:** ${prize}\n\nReact with 🎉 to enter!\nEnds: <t:${Math.floor((Date.now() + ms) / 1000)}:R>`)
-        .setFooter({ text: `Hosted by ${hostTag}` }).setTimestamp(new Date(Date.now() + ms));
-    const giveMsg = await channel.send({ content: "@everyone 🎉 **GIVEAWAY!** 🎉", embeds: [embed] });
-    await giveMsg.react("🎉");
-    setTimeout(async () => {
-        const fresh    = await giveMsg.fetch().catch(() => null); if (!fresh) return;
-        const reaction = fresh.reactions.cache.get("🎉"); if (!reaction) return channel.send("🎉 No one entered.");
-        const users    = await reaction.users.fetch();
-        const valid    = users.filter(u => !u.bot);
-        if (!valid.size) return channel.send("🎉 No eligible entrants.");
-        const winner = valid.random();
-        await channel.send({ content: `🎉 Congratulations ${winner}!`, embeds: [new EmbedBuilder().setTitle("🎉 Giveaway Ended!").setColor(0xFFD700).setDescription(`**Prize:** ${prize}\n**Winner:** ${winner}`).setFooter({ text: `Hosted by ${hostTag}` }).setTimestamp()] });
-    }, ms);
-}
-
-async function handlePollPrefix(message, content) {
-    const parts = content.replace(/^!poll\s*/i, "").trim().split("|").map(s => s.trim()).filter(Boolean);
-    if (parts.length < 3) return message.reply("❌ Usage: `!poll Question | Option 1 | Option 2`");
-    const question = parts[0];
-    const options  = parts.slice(1, 10);
-    const nums     = ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣"];
-    const embed    = new EmbedBuilder().setTitle(`📊 ${question}`).setColor(0x00FFAA).setDescription(options.map((o, i) => `${nums[i]} ${o}`).join("\n")).setFooter({ text: `Poll by ${message.author.tag}` }).setTimestamp();
-    const sent     = await message.channel.send({ embeds: [embed] });
-    for (let i = 0; i < options.length; i++) await sent.react(nums[i]).catch(() => {});
+async function handleAnnouncePrefix(message, content) {
+    // Usage: !announce Title | Description | [youtube url] | [download url] | [roblox url]
+    const body = content.replace(/^!announce\s*/i, "");
+    const parts = body.split("|").map(s => s.trim());
+    const [title, description, video, download, roblox] = parts;
+    if (!title || !description) {
+        return message.reply("❌ Usage: `!announce Title | Description | [video] | [download] | [roblox]`");
+    }
+    const ytId = video ? extractYouTubeId(video) : null;
+    await postAnnouncement(message.channel, { title, description, ytId, downloadUrl: download, robloxUrl: roblox }, message.author.tag);
     return safeDelete(message);
 }
 
-async function handleReportPrefix(message, content) {
-    const target = message.mentions.members?.first();
-    if (!target) return message.reply("❌ Mention a user.");
-    const reason = content.replace(/^!report\s+<@!?\d+>\s*/i, "").trim();
-    if (!reason) return message.reply("❌ Include a reason.");
-    await handleReportCore(message, target, reason, message.guild);
-    return message.reply("✅ Report sent to admins.");
+// ================================================================
+//  GIVEAWAY
+// ================================================================
+async function runGiveaway(channel, ms, prize, hostTag) {
+    const endsAt = Date.now() + ms;
+    const embed = new EmbedBuilder()
+        .setTitle("🎉 GIVEAWAY 🎉")
+        .setColor(0xFFD700)
+        .setDescription(`**Prize:** ${prize}\n\nReact with 🎉 to enter!\nEnds: <t:${Math.floor(endsAt / 1000)}:R>`)
+        .setFooter({ text: `Hosted by ${hostTag}` })
+        .setTimestamp();
+    const sent = await channel.send({ embeds: [embed] });
+    await sent.react("🎉").catch(() => {});
+
+    setTimeout(async () => {
+        try {
+            const fresh   = await channel.messages.fetch(sent.id).catch(() => null);
+            if (!fresh) return;
+            const reaction = fresh.reactions.cache.get("🎉");
+            const users    = reaction ? [...(await reaction.users.fetch()).values()].filter(u => !u.bot) : [];
+
+            if (!users.length) {
+                return channel.send({ embeds: [new EmbedBuilder().setTitle("🎉 Giveaway Ended").setColor(0xFFD700).setDescription(`**Prize:** ${prize}\n\nNo valid entries — no winner.`)] });
+            }
+            const winner = users[Math.floor(Math.random() * users.length)];
+            await channel.send({ embeds: [new EmbedBuilder().setTitle("🎉 Giveaway Ended").setColor(0xFFD700).setDescription(`**Prize:** ${prize}\n**Winner:** ${winner}\n\nCongratulations! 🎊`)] });
+            await winner.send(`🎉 You won **${prize}** in **${channel.guild.name}**! Congrats!`).catch(() => {});
+        } catch (e) { console.error("Giveaway draw error:", e.message); }
+    }, ms);
 }
 
+async function handleGiveawayPrefix(message, content) {
+    // Usage: !giveaway <time> <prize>
+    const parts   = content.split(" ").slice(1);
+    const timeStr = parts[0];
+    const prize   = parts.slice(1).join(" ");
+    const res     = parseTime(timeStr);
+    if (!res || !prize) return message.reply("❌ Usage: `!giveaway 10m Discord Nitro`");
+    await runGiveaway(message.channel, res.ms, prize, message.author.tag);
+    return safeDelete(message);
+}
+
+// ================================================================
+//  POLL
+// ================================================================
+async function handlePollPrefix(message, content) {
+    // Usage: !poll Question? | Option1 | Option2 | ...
+    const body  = content.replace(/^!poll\s*/i, "");
+    const parts = body.split("|").map(s => s.trim()).filter(Boolean);
+    const question = parts[0];
+    const opts      = parts.slice(1);
+    if (!question || opts.length < 2) return message.reply("❌ Usage: `!poll Question | Option1 | Option2`");
+    const nums  = ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣"];
+    const embed = new EmbedBuilder()
+        .setTitle(`📊 ${question}`)
+        .setColor(0x00FFAA)
+        .setDescription(opts.slice(0, 9).map((o, i) => `${nums[i]} ${o}`).join("\n"))
+        .setFooter({ text: `Poll by ${message.author.tag}` })
+        .setTimestamp();
+    const sent = await message.channel.send({ embeds: [embed] });
+    for (let i = 0; i < Math.min(opts.length, 9); i++) await sent.react(nums[i]).catch(() => {});
+    return safeDelete(message);
+}
+
+// ================================================================
+//  REPORT
+// ================================================================
 async function handleReportCore(source, target, reason, guild) {
-    const embed = new EmbedBuilder().setTitle("🚨 User Report").setColor(0xFF4444)
+    const s = getSettings(guild.id);
+    const logId = s.modlogChannelId || MODLOG_CHANNEL_ID;
+    const embed = new EmbedBuilder()
+        .setTitle("🚨 New Report")
+        .setColor(0xFF4444)
         .addFields(
-            { name: "Reported User", value: `${target.user?.tag || target.tag} (${target.id})`,          inline: true },
-            { name: "Reported By",   value: `${source.author?.tag || source.member?.user.tag}`,           inline: true },
-            { name: "Reason",        value: reason },
-            { name: "Jump",          value: source.url ? `[Click here](${source.url})` : "N/A" },
-        ).setTimestamp();
-    const admins = guild.members.cache.filter(m => !m.user.bot && m.permissions.has(PermissionFlagsBits.Administrator));
-    for (const [, admin] of admins) await admin.send({ embeds: [embed] }).catch(() => {});
+            { name: "Reported User", value: `${target}`, inline: true },
+            { name: "Reported By",   value: `${source.author}`, inline: true },
+            { name: "Channel",       value: source.channel ? `${source.channel}` : "Unknown", inline: true },
+            { name: "Reason",        value: reason || "No reason provided", inline: false },
+        )
+        .setTimestamp();
+
+    let posted = false;
+    if (logId) {
+        const ch = guild.channels.cache.get(logId);
+        if (ch?.send) { await ch.send({ embeds: [embed] }).catch(() => {}); posted = true; }
+    }
+    if (!posted && source.channel?.send) {
+        await source.channel.send({ content: "🚨 A report was filed (no mod-log channel configured — visible here):", embeds: [embed] }).catch(() => {});
+    }
 }
 
+async function handleReportPrefix(message, content) {
+    // Usage: !report @user reason text
+    const target = message.mentions.members?.first();
+    if (!target) return message.reply("❌ Mention the user you're reporting.");
+    const reason = content.replace(/^!report\s+<@!?\d+>\s*/i, "").trim() || "No reason provided";
+    await handleReportCore({ author: message.author, channel: message.channel }, target, reason, message.guild);
+    await safeDelete(message);
+    return message.author.send("✅ Your report has been sent to the moderators.").catch(() => {});
+}
+
+// ================================================================
+//  REMINDME
+// ================================================================
 async function handleRemindMePrefix(message, content) {
-    const parts   = content.replace(/^!remindme\s+/i, "").split(/\s+/);
+    // Usage: !remindme <time> <text>
+    const parts   = content.split(" ").slice(1);
     const timeStr = parts[0];
     const text    = parts.slice(1).join(" ");
-    if (!timeStr || !text) return message.reply("❌ Usage: `!remindme 30m text`");
-    const res = parseTime(timeStr);
-    if (!res) return message.reply("❌ Format: `30m` or `2h`");
-    if (res.ms > 24 * 3_600_000) return message.reply("❌ Max 24 hours.");
-    await message.reply(`⏰ Reminding you in **${timeStr}**.`);
+    const res     = parseTime(timeStr);
+    if (!res || !text) return message.reply("❌ Usage: `!remindme 30m Check the oven`");
+    if (res.ms > 24 * 3_600_000) return message.reply("❌ Max reminder time is 24 hours.");
+    await message.reply(`⏰ Got it! Reminding you in **${timeStr}**.`);
     setTimeout(async () => {
-        await message.author.send(`⏰ **Reminder!**\n${text}\n\n*(Set in ${message.guild.name})*`).catch(() => {
-            message.channel.send(`${message.author} ⏰ ${text}`).catch(() => {});
+        await message.author.send(`⏰ **Reminder!**\n${text}\n\n*(Set in ${message.guild.name})*`).catch(async () => {
+            await message.channel.send(`${message.author} ⏰ Reminder: **${text}**`).catch(() => {});
         });
     }, res.ms);
 }
 
-async function handleBanPrefix(message, content, action) {
+// ================================================================
+//  BAN / KICK (prefix)
+// ================================================================
+async function handleBanPrefix(message, content, type) {
     const target = message.mentions.members?.first();
-    if (!target) return message.reply(`❌ Mention a user: \`!${action} @user [reason]\``);
-    const reason = content.replace(new RegExp(`^!${action}\\s+<@!?\\d+>\\s*`, "i"), "").trim() || "No reason";
+    if (!target) return message.reply(`❌ Mention a user to ${type}.`);
+    const verb   = type === "ban" ? "!ban" : "!kick";
+    const reason = content.replace(new RegExp(`^${verb}\\s+<@!?\\d+>\\s*`, "i"), "").trim() || "No reason provided";
+
+    await target.send(`${type === "ban" ? "🔨" : "👢"} You were **${type === "ban" ? "banned" : "kicked"}** from **${message.guild.name}**.\nReason: **${reason}**`).catch(() => {});
     try {
-        await target.send(`${action === "ban" ? "🔨 Banned" : "👢 Kicked"} from **${message.guild.name}**.\nReason: **${reason}**`).catch(() => {});
-        action === "ban" ? await target.ban({ reason }) : await target.kick(reason);
-        return message.reply({ embeds: [buildActionEmbed(action === "ban" ? "🔨 Member Banned" : "👢 Member Kicked", action === "ban" ? 0xFF4444 : 0xFF8800, target.user, message.author, reason)] });
-    } catch (e) { return message.reply(`❌ Could not ${action}: ${e.message}`); }
+        if (type === "ban") await target.ban({ reason });
+        else await target.kick(reason);
+    } catch (e) {
+        return message.reply(`❌ Could not ${type}: ${e.message}`);
+    }
+
+    return message.reply({
+        embeds: [buildActionEmbed(
+            type === "ban" ? "🔨 Member Banned" : "👢 Member Kicked",
+            type === "ban" ? 0xFF4444 : 0xFF8800,
+            target.user, message.author, reason,
+        )],
+    });
+}
+
+// ================================================================
+//  TICKETS
+// ================================================================
+async function createTicketChannel(guild, requester) {
+    const s = getSettings(guild.id);
+    const overwrites = [
+        { id: guild.roles.everyone, deny: [PermissionFlagsBits.ViewChannel] },
+        { id: requester.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] },
+        { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ManageChannels] },
+    ];
+    if (s.modRoleId) overwrites.push({ id: s.modRoleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
+
+    const ch = await guild.channels.create({
+        name: sanitizeChannelName(`ticket-${requester.user.username}`),
+        type: ChannelType.GuildText,
+        parent: s.ticketCategoryId || undefined,
+        permissionOverwrites: overwrites,
+        topic: `Support ticket for ${requester.user.tag} (${requester.id})`,
+    });
+    ticketChannels.add(ch.id);
+
+    const closeRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("ticket_close_btn").setLabel("🔒 Close Ticket").setStyle(ButtonStyle.Danger),
+    );
+    await ch.send({
+        content: `${requester} Welcome to your ticket! A staff member will be with you shortly.`,
+        embeds: [new EmbedBuilder().setTitle("🎫 Support Ticket").setColor(0x00FFAA).setDescription("Describe your issue and a moderator will help. Use `!closeticket` or `/closeticket` (mods) to close this when resolved.").setTimestamp()],
+        components: [closeRow],
+    });
+    return ch;
 }
 
 async function handleTicketPrefix(message) {
-    const safeName = message.author.username.toLowerCase().replace(/[^a-z0-9]/g, "");
-    const existing = message.guild.channels.cache.find(c => c.name === `ticket-${safeName}`);
-    if (existing) return message.reply(`❌ You already have a ticket: ${existing}`);
-    const s    = getSettings(message.guild.id);
-    const opts = {
-        name:   `ticket-${safeName}`,
-        type:   ChannelType.GuildText,
-        topic:  `Ticket for ${message.author.tag}`,
-        permissionOverwrites: [
-            { id: message.guild.id,  deny:  [PermissionsBitField.Flags.ViewChannel] },
-            { id: message.author.id, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages] },
-            { id: client.user.id,    allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages] },
-        ],
-    };
-    if (s.ticketCategoryId) opts.parent = s.ticketCategoryId;
-    const channel = await message.guild.channels.create(opts);
-    if (s.modRoleId) await channel.permissionOverwrites.edit(s.modRoleId, { ViewChannel: true, SendMessages: true }).catch(() => {});
-    ticketChannels.add(channel.id);
-    await channel.send({ content: `${message.author}`, embeds: [new EmbedBuilder().setTitle("🎫 Support Ticket").setColor(0x00FFAA).setDescription(`Hello ${message.author}! Describe your issue.\n\nMods: \`!closeticket\` to close.`).setTimestamp()] });
-    return message.reply(`✅ Ticket opened: ${channel}`);
+    const existing = [...message.guild.channels.cache.values()].find(
+        c => ticketChannels.has(c.id) && c.topic?.includes(`(${message.author.id})`)
+    );
+    if (existing) return message.reply(`❌ You already have an open ticket: ${existing}`);
+    try {
+        const ch = await createTicketChannel(message.guild, message.member);
+        return message.reply(`✅ Ticket created: ${ch}`);
+    } catch (e) { return message.reply(`❌ Could not create ticket: ${e.message}`); }
 }
 
 async function handleTicketSlash(interaction, member, guild, reply, replyErr) {
-    const safeName = member.user.username.toLowerCase().replace(/[^a-z0-9]/g, "");
-    const existing = guild.channels.cache.find(c => c.name === `ticket-${safeName}`);
-    if (existing) return replyErr(`You already have a ticket: ${existing}`);
-    const s    = getSettings(guild.id);
-    const opts = {
-        name:   `ticket-${safeName}`,
-        type:   ChannelType.GuildText,
-        topic:  `Ticket for ${member.user.tag}`,
-        permissionOverwrites: [
-            { id: guild.id,       deny:  [PermissionsBitField.Flags.ViewChannel] },
-            { id: member.id,      allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages] },
-            { id: client.user.id, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages] },
-        ],
-    };
-    if (s.ticketCategoryId) opts.parent = s.ticketCategoryId;
-    const channel = await guild.channels.create(opts);
-    if (s.modRoleId) await channel.permissionOverwrites.edit(s.modRoleId, { ViewChannel: true, SendMessages: true }).catch(() => {});
-    ticketChannels.add(channel.id);
-    await channel.send({ content: `${member}`, embeds: [new EmbedBuilder().setTitle("🎫 Support Ticket").setColor(0x00FFAA).setDescription(`Hello ${member}! Describe your issue.\n\nMods: \`/closeticket\` to close.`).setTimestamp()] });
-    return reply(`✅ Ticket opened: ${channel}`, true);
+    const existing = [...guild.channels.cache.values()].find(
+        c => ticketChannels.has(c.id) && c.topic?.includes(`(${member.id})`)
+    );
+    if (existing) return replyErr(`You already have an open ticket: ${existing}`);
+    try {
+        const ch = await createTicketChannel(guild, member);
+        return reply(`✅ Ticket created: ${ch}`, true);
+    } catch (e) { return replyErr(`Could not create ticket: ${e.message}`); }
 }
 
 // ================================================================
 //  EMBED BUILDERS
 // ================================================================
-function buildHelpEmbed(permLevel) {
-    const e = new EmbedBuilder()
-        .setTitle("🤖 Yobest Bot v4.6 — Commands")
-        .setColor(0x00FFAA)
-        .addFields({
-            name: "✨ Public",
-            value:
-                "`/ping` `/stats` `/serverinfo` `/servericon` `/botinfo`\n" +
-                "`/userinfo` `/avatar` `/roll` `/coinflip` `/rps` `/8ball`\n" +
-                "`/quote` `/math` `/suggest` `/poll` `/report`\n" +
-                "`/remindme` `/site` `/discord` `/rank` `/leaderboard`\n" +
-                "`/ticket` `/snipe` `/help`",
-        });
-    if (requireLevel("mod", permLevel)) {
-        e.addFields({ name: "🛡️ Moderator", value: "`/warn` `/warnings` `/clearwarnings` `/mute` `/unmute`\n`/purge` `/slowmode` `/lock` `/unlock` `/closeticket` `/setnickname`" });
-    }
-    if (requireLevel("admin", permLevel)) {
-        e.addFields(
-            { name: "🔨 Admin", value: "`/ban` `/kick` `/announce` `/giveaway`\n`/setwelcome` `/setgoodbyemsg` `/setmodrole` `/setautorole`\n`/setwelcomechannel` `/setgoodbyechannel` `/setmodlogchannel`\n`/setticketcategory` `/enableai` `/disableai`\n`/addcmd` `/removecmd` `/listcmds` `/reactionrole` `/clearxp`" },
-            { name: "🏗️ AI Server Builder", value: "`/generate <prompt>` — Build full server from one sentence\n`/agent <instruction>` — Edit server with natural language\n`/agentclear` — Reset agent conversation" },
-            { name: "📜 Script Announcer",  value: "`/announcescript title: desc: script: [language] [video] [download]`\nPosts collapsed preview + 👁️ View / 📋 Copy / ⬇️ Download buttons" },
-        );
-    }
-    if (permLevel === "owner") {
-        e.addFields({ name: "👑 Owner", value: "`/scanandclean` `/testautomod` `/aitest`" });
-    }
-    e.addFields({ name: "💡 Tips", value: `• Every \`!command\` also works as \`/command\`\n• 🛡️ Auto-mod always active — instant + AI\n• 🧠 AI Model: \`${OPENROUTER_MODEL}\`` });
-    e.setFooter({ text: "Yobest_BYTR Bot v4.6" }).setTimestamp();
-    return e;
-}
-
 function buildStatsEmbed(guild) {
+    const mem = process.memoryUsage();
     return new EmbedBuilder()
-        .setTitle("📊 Bot & Server Stats — v4.6").setColor(0x00FFAA)
+        .setTitle("📊 Bot & Server Stats")
+        .setColor(0x00FFAA)
         .addFields(
-            { name: "👥 Members",      value: `${guild.memberCount}`,                      inline: true },
-            { name: "⏱️ Uptime",       value: formatUptime(Date.now() - startTime),         inline: true },
-            { name: "🌐 Servers",      value: `${client.guilds.cache.size}`,                inline: true },
-            { name: "🧠 AI Model",     value: OPENROUTER_MODEL,                             inline: true },
-            { name: "⚡ Anti-Spam",    value: `${SPAM_LIMIT} msg/${SPAM_WINDOW_MS/1000}s`,  inline: true },
-            { name: "🤬 Profanity",    value: `${PROFANITY_PATTERNS.length} patterns`,      inline: true },
-            { name: "📝 Scam Phrases", value: `${SCAM_PHRASES.length} patterns`,           inline: true },
-            { name: "🔗 Scam Domains", value: `${SCAM_DOMAINS.length} patterns`,           inline: true },
-        ).setTimestamp();
+            { name: "🏓 Ping",        value: `${Math.round(client.ws.ping)}ms`, inline: true },
+            { name: "⏱️ Uptime",      value: formatUptime(Date.now() - startTime), inline: true },
+            { name: "💾 Memory",      value: `${(mem.heapUsed / 1024 / 1024).toFixed(1)} MB`, inline: true },
+            { name: "🌐 Servers",     value: `${client.guilds.cache.size}`, inline: true },
+            { name: "👥 Members",     value: `${guild?.memberCount ?? "?"}`, inline: true },
+            { name: "📦 Version",     value: "v4.7", inline: true },
+        )
+        .setFooter({ text: `${SITE_INFO.name}` })
+        .setTimestamp();
 }
 
 function buildBotInfoEmbed() {
     return new EmbedBuilder()
-        .setTitle("🤖 Yobest Bot — Info").setColor(0x00FFAA)
+        .setTitle(`🤖 ${client.user.username}`)
+        .setColor(0x00FFAA)
         .setThumbnail(client.user.displayAvatarURL({ dynamic: true }))
         .addFields(
-            { name: "📛 Name",       value: client.user.tag,                                    inline: true },
-            { name: "🆔 ID",         value: client.user.id,                                     inline: true },
-            { name: "📅 Created",    value: `<t:${Math.floor(client.user.createdTimestamp/1000)}:D>`, inline: true },
-            { name: "🌐 Servers",    value: `${client.guilds.cache.size}`,                      inline: true },
-            { name: "⏱️ Uptime",     value: formatUptime(Date.now() - startTime),               inline: true },
-            { name: "🔢 Version",    value: "v4.6",                                             inline: true },
-            { name: "🧠 AI Model",   value: OPENROUTER_MODEL,                                   inline: true },
-            { name: "🏗️ AI Builder", value: "✅ /generate + /agent",                           inline: true },
-            { name: "📜 Scripts",    value: "✅ /announcescript",                               inline: true },
+            { name: "Version",     value: "v4.7", inline: true },
+            { name: "Library",     value: "discord.js", inline: true },
+            { name: "Node.js",     value: process.version, inline: true },
+            { name: "Uptime",      value: formatUptime(Date.now() - startTime), inline: true },
+            { name: "Servers",     value: `${client.guilds.cache.size}`, inline: true },
+            { name: "AI Model",    value: `\`${OPENROUTER_MODEL}\``, inline: true },
+            { name: "Features",    value: "Auto-mod, AI chat, AI Server Builder/Agent, Owner /command, XP, tickets, giveaways, reaction roles", inline: false },
         )
-        .setFooter({ text: "Yobest_BYTR Bot v4.6 • Made for Yobest Studio" })
+        .setFooter({ text: SITE_INFO.name })
         .setTimestamp();
 }
 
 function buildServerInfoEmbed(guild) {
+    const owner = guild.members.cache.get(guild.ownerId);
     return new EmbedBuilder()
-        .setTitle(`🏠 ${guild.name}`).setColor(0x00FFAA)
+        .setTitle(`🏠 ${guild.name}`)
+        .setColor(0x00FFAA)
         .setThumbnail(guild.iconURL({ dynamic: true }) || null)
         .addFields(
-            { name: "👑 Owner",    value: `<@${guild.ownerId}>`,                             inline: true },
-            { name: "👥 Members", value: `${guild.memberCount}`,                             inline: true },
-            { name: "📅 Created", value: `<t:${Math.floor(guild.createdTimestamp/1000)}:D>`, inline: true },
-            { name: "💬 Channels",value: `${guild.channels.cache.size}`,                     inline: true },
-            { name: "😀 Emojis",  value: `${guild.emojis.cache.size}`,                       inline: true },
-            { name: "🆔 ID",      value: guild.id,                                           inline: true },
-        ).setTimestamp();
+            { name: "Owner",        value: owner ? `${owner.user.tag}` : guild.ownerId, inline: true },
+            { name: "Members",      value: `${guild.memberCount}`, inline: true },
+            { name: "Created",      value: `<t:${Math.floor(guild.createdTimestamp / 1000)}:R>`, inline: true },
+            { name: "Channels",     value: `${guild.channels.cache.size}`, inline: true },
+            { name: "Roles",        value: `${guild.roles.cache.size}`, inline: true },
+            { name: "Boost Level",  value: `${guild.premiumTier ?? 0} (${guild.premiumSubscriptionCount ?? 0} boosts)`, inline: true },
+        )
+        .setFooter({ text: `ID: ${guild.id}` })
+        .setTimestamp();
 }
 
-function buildUserInfoEmbed(target, guild) {
-    const warns = warnHistory.get(target.id) || [];
-    const xp    = xpData.get(target.id) || { xp: 0, level: 0 };
+function buildUserInfoEmbed(member, guild) {
+    const roles = member.roles.cache.filter(r => r.id !== guild.id).sort((a, b) => b.position - a.position).map(r => r.toString()).slice(0, 15);
     return new EmbedBuilder()
-        .setTitle(`👤 ${target.user.tag}`).setColor(0x00FFAA)
-        .setThumbnail(target.user.displayAvatarURL({ dynamic: true }))
+        .setTitle(`👤 ${member.user.tag}`)
+        .setColor(member.displayHexColor && member.displayHexColor !== "#000000" ? member.displayHexColor : 0x00FFAA)
+        .setThumbnail(member.user.displayAvatarURL({ dynamic: true }))
         .addFields(
-            { name: "🆔 ID",       value: target.id,                                                 inline: true },
-            { name: "📅 Account",  value: `<t:${Math.floor(target.user.createdTimestamp/1000)}:D>`, inline: true },
-            { name: "📥 Joined",   value: `<t:${Math.floor(target.joinedTimestamp/1000)}:D>`,       inline: true },
-            { name: "⭐ Level",    value: `${xp.level}`,                                            inline: true },
-            { name: "✨ XP",       value: `${xp.xp}`,                                              inline: true },
-            { name: "⚠️ Warnings", value: `${warns.length}`,                                        inline: true },
-            { name: "🎭 Roles",    value: target.roles.cache.size > 1 ? target.roles.cache.filter(r => r.id !== guild.id).map(r => r.toString()).join(", ").slice(0, 1024) : "None" },
-        ).setTimestamp();
+            { name: "Joined Server", value: member.joinedTimestamp ? `<t:${Math.floor(member.joinedTimestamp / 1000)}:R>` : "Unknown", inline: true },
+            { name: "Account Created", value: `<t:${Math.floor(member.user.createdTimestamp / 1000)}:R>`, inline: true },
+            { name: "Top Role",     value: member.roles.highest.id !== guild.id ? `${member.roles.highest}` : "None", inline: true },
+            { name: `Roles [${roles.length}]`, value: roles.length ? roles.join(" ") : "None", inline: false },
+        )
+        .setFooter({ text: `ID: ${member.id}` })
+        .setTimestamp();
 }
 
-function buildWarningsEmbed(user, warnings) {
+function buildWarningsEmbed(user, warns) {
+    const lines = warns.slice(-15).map((w, i) => `**#${i + 1}** — ${w.reason}\n*by ${w.by} • <t:${Math.floor(w.ts / 1000)}:R>*`);
     return new EmbedBuilder()
-        .setTitle(`⚠️ Warnings for ${user.tag}`).setColor(0xFF8800)
-        .setDescription(warnings.map((w, i) => `**#${i+1}** — ${w.reason}\n↳ By ${w.by} <t:${Math.floor(w.ts/1000)}:R>`).join("\n\n"))
+        .setTitle(`⚠️ Warnings for ${user.tag}`)
+        .setColor(0xFF8800)
+        .setDescription(lines.join("\n\n") || "No warnings.")
+        .setFooter({ text: `Total: ${warns.length}` })
         .setTimestamp();
 }
 
 function buildActionEmbed(title, color, target, by, reason) {
     return new EmbedBuilder()
-        .setColor(color).setTitle(title)
-        .addFields({ name: "User", value: target.tag, inline: true }, { name: "By", value: by.tag, inline: true }, { name: "Reason", value: reason })
+        .setTitle(title)
+        .setColor(color)
+        .setThumbnail(target.displayAvatarURL({ dynamic: true }))
+        .addFields(
+            { name: "User",      value: `${target.tag} (${target.id})`, inline: true },
+            { name: "Moderator", value: by.tag, inline: true },
+            { name: "Reason",    value: reason, inline: false },
+        )
         .setTimestamp();
 }
 
 function buildSiteEmbed() {
-    return new EmbedBuilder()
-        .setTitle(`🌐 ${SITE_INFO.name}`).setColor(0x00FFAA)
+    const embed = new EmbedBuilder()
+        .setTitle(`🌐 ${SITE_INFO.name}`)
+        .setColor(0x00FFAA)
         .setDescription(SITE_INFO.description)
-        .addFields(
-            { name: "🔗 Links",         value: Object.entries(SITE_INFO.links).map(([k, v]) => `[${k}](${v})`).join("\n") },
-            { name: "✨ What's inside", value: SITE_INFO.highlights.map(h => `• ${h}`).join("\n") },
-        ).setTimestamp();
+        .addFields({ name: "✨ Highlights", value: SITE_INFO.highlights.map(h => `• ${h}`).join("\n"), inline: false })
+        .setURL(SITE_INFO.url)
+        .setFooter({ text: SITE_INFO.url })
+        .setTimestamp();
+    return embed;
 }
 
 function buildSiteRow() {
-    return new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setLabel("Visit Site").setStyle(ButtonStyle.Link).setURL(SITE_INFO.url).setEmoji("🌐")
-    );
+    const row = new ActionRowBuilder();
+    for (const [label, url] of Object.entries(SITE_INFO.links)) {
+        row.addComponents(new ButtonBuilder().setLabel(`🌐 ${label}`).setStyle(ButtonStyle.Link).setURL(url));
+    }
+    return row;
 }
 
 function buildLeaderboard(guild) {
-    const sorted = [...xpData.entries()]
-        .sort(([, a], [, b]) => (b.level * 10000 + b.xp) - (a.level * 10000 + a.xp))
+    const entries = [...xpData.entries()]
+        .filter(([id]) => guild.members.cache.has(id))
+        .sort((a, b) => b[1].xp - a[1].xp)
         .slice(0, 10);
-    const medals = ["🥇","🥈","🥉","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"];
-    const lines  = sorted.map(([uid, data], i) => {
-        const name = guild.members.cache.get(uid)?.user.username || `<@${uid}>`;
-        return `${medals[i]} **${name}** — Level ${data.level} (${data.xp} XP)`;
-    }).join("\n");
-    return new EmbedBuilder().setTitle("🏆 XP Leaderboard").setColor(0xFFD700).setDescription(lines || "No XP yet.").setTimestamp();
+    const medals = ["🥇", "🥈", "🥉"];
+    const lines = entries.map(([id, d], i) => {
+        const member = guild.members.cache.get(id);
+        const tag    = member ? member.user.tag : id;
+        return `${medals[i] || `**#${i + 1}**`} ${tag} — Level **${d.level}** (${d.xp} XP)`;
+    });
+    return new EmbedBuilder()
+        .setTitle(`⭐ ${guild.name} — XP Leaderboard`)
+        .setColor(0xFFD700)
+        .setDescription(lines.join("\n") || "No XP data yet — start chatting!")
+        .setTimestamp();
 }
 
-function buildXPBar(current, needed) {
-    const pct    = Math.min(current / needed, 1);
-    const filled = Math.round(pct * 20);
-    return `\`[${"█".repeat(filled)}${"░".repeat(20 - filled)}]\` ${Math.round(pct * 100)}%`;
+function buildHelpEmbed(permLevel) {
+    const embed = new EmbedBuilder()
+        .setTitle("📖 Yobest Bot — Command List")
+        .setColor(0x00FFAA)
+        .setDescription("Use `/` slash commands or the `!` prefix shown below. Items marked with a tier are restricted.")
+        .addFields({
+            name: "🌐 Public",
+            value: "`/ping` `/stats` `/serverinfo` `/botinfo` `/userinfo` `/avatar` `/roll` `/coinflip` `/rps` `/8ball` `/quote` `/math` `/suggest` `/poll` `/report` `/remindme` `/site` `/discord` `/rank` `/leaderboard` `/ticket` `/snipe` `/help`",
+            inline: false,
+        });
+
+    if (requireLevel("mod", permLevel)) {
+        embed.addFields({
+            name: "🛡️ Mod+",
+            value: "`/warn` `/warnings` `/clearwarnings` `/mute` `/unmute` `/purge` `/slowmode` `/lock` `/unlock` `/closeticket` `/setnickname`",
+            inline: false,
+        });
+    }
+    if (requireLevel("admin", permLevel)) {
+        embed.addFields({
+            name: "👑 Admin+",
+            value: "`/ban` `/kick` `/announce` `/giveaway` `/announcescript` `/generate` `/agent` `/agentclear` `/setwelcome` `/setgoodbyemsg` `/setmodrole` `/setautorole` `/setwelcomechannel` `/setgoodbyechannel` `/setmodlogchannel` `/setticketcategory` `/enableai` `/disableai` `/addcmd` `/removecmd` `/listcmds` `/reactionrole` `/clearxp`",
+            inline: false,
+        });
+    }
+    if (permLevel === "owner") {
+        embed.addFields({
+            name: "🔑 Owner Only",
+            value: "`/command` — plain-language control (confirm-gated for destructive actions)\n`/scanandclean` `/testautomod` `/aitest`",
+            inline: false,
+        });
+    }
+    embed.setFooter({ text: "Prefix commands mirror most slash commands, e.g. !ping, !help" }).setTimestamp();
+    return embed;
 }
 
 // ================================================================
 //  AI CHAT RESPONSE SENDER
 // ================================================================
-async function sendAIResponse(message, text) {
-    const MAX       = 1900;
-    const codeMatch = text.match(/```lua[\s\S]*?```/);
-    if (codeMatch) {
-        const intro = text.slice(0, codeMatch.index).trim();
-        const after = text.slice(codeMatch.index + codeMatch[0].length).trim();
-        if (intro) await message.reply({ embeds: [new EmbedBuilder().setTitle("📜 Script Ready").setColor(0x00FFAA).setDescription(intro.slice(0, 4000))] });
-        const chunks = splitCode(codeMatch[0].replace(/^```lua\n?/, "").replace(/```$/, ""), MAX - 20);
-        for (let i = 0; i < chunks.length; i++) {
-            const label = chunks.length > 1 ? `**Part ${i+1}/${chunks.length}**\n` : "";
-            await message.channel.send(`${label}\`\`\`lua\n${chunks[i].trimEnd()}\n\`\`\``);
+async function sendPlainText(message, text) {
+    if (text.length <= 2000) return message.channel.send(text);
+    const chunks = splitCode(text, 1900);
+    for (const chunk of chunks) await message.channel.send(chunk);
+}
+
+async function sendAIResponse(message, response) {
+    try {
+        const codeBlockRegex = /```(\w+)?\n([\s\S]*?)```/g;
+        let lastIndex = 0;
+        let match;
+        let any = false;
+
+        while ((match = codeBlockRegex.exec(response)) !== null) {
+            any = true;
+            const before = response.slice(lastIndex, match.index).trim();
+            if (before) await sendPlainText(message, before);
+
+            const lang  = match[1] || "lua";
+            const code  = match[2];
+            const chunks = splitCode(code, 1900);
+            for (const chunk of chunks) {
+                await message.channel.send(`\`\`\`${lang}\n${chunk}\n\`\`\``);
+            }
+            lastIndex = codeBlockRegex.lastIndex;
         }
-        if (after) await sendPlainText(message, after, MAX);
-        return;
+
+        const after = response.slice(lastIndex).trim();
+        if (after || !any) await sendPlainText(message, after || response);
+    } catch (e) {
+        console.error("sendAIResponse error:", e.message);
+        await message.channel.send("⚠️ Had trouble formatting that reply — please try again.").catch(() => {});
     }
-    await sendPlainText(message, text, MAX);
-}
-
-async function sendPlainText(message, text, max) {
-    if (text.length <= max) return message.reply(text);
-    let rem = text, first = true;
-    while (rem.length > 0) {
-        let idx = rem.length > max ? rem.lastIndexOf("\n", max) : rem.length;
-        if (idx <= 0) idx = Math.min(max, rem.length);
-        const chunk = rem.slice(0, idx);
-        first ? await message.reply(chunk) : await message.channel.send(chunk);
-        first = false;
-        rem = rem.slice(idx).trim();
-    }
-}
-
-function splitCode(code, max) {
-    if (code.length <= max) return [code];
-    const lines  = code.split("\n");
-    const chunks = [];
-    let cur      = "";
-    for (const line of lines) {
-        if ((cur + line + "\n").length > max) { chunks.push(cur); cur = ""; }
-        cur += line + "\n";
-    }
-    if (cur) chunks.push(cur);
-    return chunks;
-}
-
-// ================================================================
-//  UTILITIES
-// ================================================================
-function parseTime(str) {
-    const m = str?.match(/^(\d+)(s|m|h)$/i);
-    if (!m) return null;
-    const amount = parseInt(m[1]);
-    const unit   = m[2].toLowerCase();
-    const ms     = unit === "h" ? amount * 3_600_000 : unit === "m" ? amount * 60_000 : amount * 1_000;
-    return { ms, amount, unit };
-}
-
-function formatUptime(ms) {
-    const s = Math.floor(ms / 1000)      % 60;
-    const m = Math.floor(ms / 60_000)    % 60;
-    const h = Math.floor(ms / 3_600_000) % 24;
-    const d = Math.floor(ms / 86_400_000);
-    return `${d}d ${h}h ${m}m ${s}s`;
-}
-
-function extractYouTubeId(input) {
-    if (!input) return null;
-    const t = input.trim();
-    if (/^[a-zA-Z0-9_\-]{11}$/.test(t)) return t;
-    const patterns = [
-        /(?:youtube\.com\/watch\?v=)([a-zA-Z0-9_\-]{11})/,
-        /(?:youtu\.be\/)([a-zA-Z0-9_\-]{11})/,
-        /(?:youtube\.com\/shorts\/)([a-zA-Z0-9_\-]{11})/,
-    ];
-    for (const p of patterns) { const m = t.match(p); if (m) return m[1]; }
-    return t;
-}
-
-function extractUrl(input) {
-    if (!input) return null;
-    const t  = input.trim();
-    const md = t.match(/\[.*?\]\((https?:\/\/[^\s)]+)\)/);
-    if (md) return md[1];
-    const url = t.match(/https?:\/\/\S+/);
-    if (url) return url[0];
-    return t;
 }
 
 // ================================================================
