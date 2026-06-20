@@ -22,6 +22,9 @@
 
 "use strict";
 
+// ====================== DATABASE ======================
+const db = require("./db");
+
 const {
     Client,
     GatewayIntentBits,
@@ -269,7 +272,7 @@ const XP_FOR_LEVEL = (lvl) => 100 * lvl * lvl;
 
 // ====================== HELPERS ======================
 
-function addXP(userId, amount) {
+function addXP(userId, amount, meta = {}) {
     const data  = xpData.get(userId) || { xp: 0, level: 0 };
     data.xp    += amount;
     let leveled = false;
@@ -279,12 +282,23 @@ function addXP(userId, amount) {
         leveled = true;
     }
     xpData.set(userId, data);
+    db.saveXP(userId, data, meta).catch(() => {});
     return { ...data, leveled };
+}
+
+function wrapSettings(guildId, obj) {
+    return new Proxy(obj, {
+        set(target, prop, value) {
+            target[prop] = value;
+            db.saveGuildSettings(guildId, target).catch(() => {});
+            return true;
+        },
+    });
 }
 
 function getSettings(guildId) {
     if (!guildSettings.has(guildId)) {
-        guildSettings.set(guildId, {
+        const obj = {
             modRoleId:        null,
             autoRoleId:       null,
             welcomeChannelId: WELCOME_CHANNEL_ID,
@@ -293,7 +307,8 @@ function getSettings(guildId) {
             ticketCategoryId: null,
             welcomeMessage,
             goodbyeMessage,
-        });
+        };
+        guildSettings.set(guildId, wrapSettings(guildId, obj));
     }
     return guildSettings.get(guildId);
 }
@@ -352,10 +367,11 @@ function extractUrl(input) {
     return t;
 }
 
-function addWarning(userId, reason, by) {
+function addWarning(userId, reason, by, guildId = null) {
     const w = warnHistory.get(userId) || [];
     w.push({ reason, ts: Date.now(), by });
     warnHistory.set(userId, w);
+    db.saveWarning(userId, guildId, reason, by).catch(() => {});
     return w;
 }
 
@@ -604,6 +620,19 @@ const slashCommands = [
         .setName("clearxp").setDescription("[Admin] Reset XP for a user")
         .addUserOption(o => o.setName("user").setDescription("Target user").setRequired(true)),
 
+    // GAME CATALOG
+    new SlashCommandBuilder()
+        .setName("addgame").setDescription("[Admin] Add a game to the website catalog")
+        .addStringOption(o => o.setName("title").setDescription("Game title").setRequired(true))
+        .addStringOption(o => o.setName("description").setDescription("Short description"))
+        .addStringOption(o => o.setName("link").setDescription("Roblox play URL"))
+        .addStringOption(o => o.setName("image").setDescription("Cover image URL")),
+    new SlashCommandBuilder()
+        .setName("removegame").setDescription("[Admin] Remove a game from the website catalog")
+        .addStringOption(o => o.setName("title").setDescription("Exact game title").setRequired(true)),
+    new SlashCommandBuilder()
+        .setName("listgames").setDescription("[Admin] Show all games in the catalog"),
+
     // OWNER
     new SlashCommandBuilder().setName("scanandclean").setDescription("[Owner] Scan + clean last 100 messages"),
     new SlashCommandBuilder().setName("testautomod").setDescription("[Owner] Test the auto-mod pipeline"),
@@ -632,6 +661,57 @@ async function registerSlashCommands() {
 client.once("ready", async () => {
     console.log(`✅ Yobest_BYTR Bot v4.7 Online — ${client.user.tag}`);
     client.user.setActivity("🛡️ Protecting the server | v4.7", { type: 3 });
+
+    // ---- Neon: init schema + hydrate in-memory state ----
+    await db.initSchema();
+    const state = await db.loadAllState();
+
+    // guild settings
+    for (const row of (state.guildSettings || [])) {
+        const obj = {
+            modRoleId:        row.mod_role_id,
+            autoRoleId:       row.auto_role_id,
+            welcomeChannelId: row.welcome_channel || WELCOME_CHANNEL_ID,
+            goodbyeChannelId: row.goodbye_channel,
+            modlogChannelId:  row.modlog_channel  || MODLOG_CHANNEL_ID,
+            ticketCategoryId: row.ticket_category,
+            welcomeMessage:   row.welcome_message || welcomeMessage,
+            goodbyeMessage:   row.goodbye_message || goodbyeMessage,
+        };
+        guildSettings.set(row.guild_id, wrapSettings(row.guild_id, obj));
+    }
+    // XP
+    for (const row of (state.xp || [])) xpData.set(row.user_id, { xp: row.xp, level: row.level });
+    // warnings (rebuild warnHistory Map)
+    for (const row of (state.warnings || [])) {
+        const w = warnHistory.get(row.user_id) || [];
+        w.push({ reason: row.reason, ts: new Date(row.ts).getTime(), by: row.warned_by });
+        warnHistory.set(row.user_id, w);
+    }
+    // custom commands
+    for (const row of (state.customCommands || [])) {
+        const map = customCmds.get(row.guild_id) || new Map();
+        map.set(row.trigger, row.response);
+        customCmds.set(row.guild_id, map);
+    }
+    // reaction roles
+    for (const row of (state.reactionRoles || []))
+        reactionRoles.set(`${row.guild_id}:${row.message_id}:${row.emoji}`, row.role_id);
+    // open tickets
+    for (const channelId of (state.openTickets || [])) ticketChannels.add(channelId);
+    // scripts
+    for (const row of (state.scripts || []))
+        scriptStore.set(row.script_id, { script: row.script, lang: row.lang, title: row.title });
+
+    console.log(`✅ Hydrated from Neon: ${(state.xp||[]).length} XP rows, ${(state.warnings||[]).length} warnings, ${(state.openTickets||[]).length} open tickets.`);
+
+    // ---- snapshot guild stats immediately + every 5 min ----
+    const snapshotAll = () => {
+        for (const g of client.guilds.cache.values()) db.upsertGuildSnapshot(g).catch(() => {});
+    };
+    snapshotAll();
+    setInterval(snapshotAll, 5 * 60 * 1000);
+
     await registerSlashCommands();
     await runStartupSelfTest();
 });
@@ -669,6 +749,7 @@ async function runStartupSelfTest() {
 // ====================== EVENTS ======================
 client.on("guildMemberAdd", async (member) => {
     try {
+        db.upsertGuildSnapshot(member.guild).catch(() => {});
         const s = getSettings(member.guild.id);
         if (s.autoRoleId) {
             const role = member.guild.roles.cache.get(s.autoRoleId);
@@ -697,6 +778,7 @@ client.on("guildMemberAdd", async (member) => {
 
 client.on("guildMemberRemove", async (member) => {
     try {
+        db.upsertGuildSnapshot(member.guild).catch(() => {});
         const s = getSettings(member.guild.id);
         if (!s.goodbyeChannelId) return;
         const ch = member.guild.channels.cache.get(s.goodbyeChannelId);
@@ -1030,7 +1112,7 @@ client.on("interactionCreate", async (interaction) => {
             const target = interaction.options.getMember("user");
             const reason = interaction.options.getString("reason");
             if (!target) return replyErr("User not found.");
-            const warns = addWarning(target.id, reason, member.user.tag);
+            const warns = addWarning(target.id, reason, member.user.tag, guild.id);
             await target.send(`⚠️ You were **warned** in **${guild.name}**.\nReason: **${reason}**\nWarning #${warns.length}`).catch(() => {});
             return reply(`⚠️ ${target} warned (${warns.length} total). Reason: **${reason}**`);
         }
@@ -1047,6 +1129,7 @@ client.on("interactionCreate", async (interaction) => {
             const target = interaction.options.getMember("user");
             if (!target) return replyErr("User not found.");
             warnHistory.delete(target.id);
+            db.clearWarnings(target.id).catch(() => {});
             return reply(`✅ Cleared warnings for ${target}.`);
         }
         if (commandName === "mute") {
@@ -1094,6 +1177,7 @@ client.on("interactionCreate", async (interaction) => {
             await interaction.channel.send("🎫 Ticket closed.").catch(() => {});
             setTimeout(() => interaction.channel.delete().catch(() => {}), 3000);
             ticketChannels.delete(interaction.channelId);
+            db.closeTicket(interaction.channelId).catch(() => {});
             return;
         }
         if (commandName === "setnickname") {
@@ -1195,6 +1279,7 @@ client.on("interactionCreate", async (interaction) => {
             const map = customCmds.get(guild.id) || new Map();
             map.set(trigger, response);
             customCmds.set(guild.id, map);
+            db.setCustomCommand(guild.id, trigger, response).catch(() => {});
             return reply(`✅ Custom command \`!${trigger}\` added.`);
         }
         if (commandName === "removecmd") {
@@ -1203,6 +1288,7 @@ client.on("interactionCreate", async (interaction) => {
             const map = customCmds.get(guild.id);
             if (!map || !map.has(trigger)) return replyErr(`No command \`!${trigger}\` found.`);
             map.delete(trigger);
+            db.removeCustomCommand(guild.id, trigger).catch(() => {});
             return reply(`✅ Removed \`!${trigger}\`.`);
         }
         if (commandName === "listcmds") {
@@ -1217,6 +1303,7 @@ client.on("interactionCreate", async (interaction) => {
             const emoji = interaction.options.getString("emoji");
             const role  = interaction.options.getRole("role");
             reactionRoles.set(`${guild.id}:${msgId}:${emoji}`, role.id);
+            db.addReactionRole(guild.id, msgId, emoji, role.id).catch(() => {});
             try { const msg = await interaction.channel.messages.fetch(msgId); await msg.react(emoji); } catch {}
             return reply(`✅ Reaction role set! ${emoji} → **${role.name}**.`);
         }
@@ -1225,7 +1312,35 @@ client.on("interactionCreate", async (interaction) => {
             const target = interaction.options.getMember("user");
             if (!target) return replyErr("User not found.");
             xpData.delete(target.id);
+            db.clearXP(target.id).catch(() => {});
             return reply(`✅ XP reset for ${target}.`);
+        }
+
+        // ---- GAME CATALOG ----
+        if (commandName === "addgame") {
+            if (!requireLevel("admin", permLevel)) return replyErr("You need Admin or higher.");
+            const title = interaction.options.getString("title");
+            const desc  = interaction.options.getString("description");
+            const link  = interaction.options.getString("link");
+            const image = interaction.options.getString("image");
+            if (!db.ready()) return replyErr("Database not configured — set DATABASE_URL to enable the game catalog.");
+            await db.addGame(title, desc, link, image, member.user.tag);
+            return reply(`✅ **${title}** added to the website catalog.`);
+        }
+        if (commandName === "removegame") {
+            if (!requireLevel("admin", permLevel)) return replyErr("You need Admin or higher.");
+            const title = interaction.options.getString("title");
+            if (!db.ready()) return replyErr("Database not configured.");
+            const removed = await db.removeGame(title);
+            return removed ? reply(`✅ **${title}** removed from the catalog.`) : replyErr(`No game found with title **${title}**.`);
+        }
+        if (commandName === "listgames") {
+            if (!requireLevel("admin", permLevel)) return replyErr("You need Admin or higher.");
+            if (!db.ready()) return replyErr("Database not configured.");
+            const games = await db.listGames();
+            if (!games.length) return reply("No games in the catalog yet. Use `/addgame` to add one.");
+            const lines = games.map((g, i) => `**${i + 1}.** ${g.title} *(${g.status})* ${g.play_url ? `— [Play](${g.play_url})` : ""}`);
+            return reply({ embeds: [new EmbedBuilder().setTitle("🎮 Game Catalog").setColor(0x00FFAA).setDescription(lines.join("\n")).setFooter({ text: "Manage with /addgame and /removegame" })] });
         }
 
         // ---- OWNER ----
@@ -1342,8 +1457,9 @@ async function handleButtonInteraction(interaction) {
     }
 
     if (id.startsWith("script_view_")) {
-        const data = scriptStore.get(id.replace("script_view_", ""));
-        if (!data) return interaction.reply({ content: "❌ Script data expired (bot restarted — use the download attachment on the announcement post instead).", ephemeral: true });
+        const scriptId = id.replace("script_view_", "");
+        let data = scriptStore.get(scriptId) || await db.getScript(scriptId);
+        if (!data) return interaction.reply({ content: "❌ Script data not found — use the download attachment on the announcement post instead.", ephemeral: true });
         const chunks = splitCode(data.script, 1900);
         await interaction.reply({ content: `📜 **Full Script** (${chunks.length} part${chunks.length > 1 ? "s" : ""}):\n\`\`\`${data.lang}\n${chunks[0]}\n\`\`\``, ephemeral: true });
         for (let i = 1; i < chunks.length; i++)
@@ -1352,8 +1468,9 @@ async function handleButtonInteraction(interaction) {
     }
 
     if (id.startsWith("script_copy_")) {
-        const data = scriptStore.get(id.replace("script_copy_", ""));
-        if (!data) return interaction.reply({ content: "❌ Script data expired.", ephemeral: true });
+        const scriptId = id.replace("script_copy_", "");
+        const data = scriptStore.get(scriptId) || await db.getScript(scriptId);
+        if (!data) return interaction.reply({ content: "❌ Script data not found.", ephemeral: true });
         const preview = data.script.slice(0, 1800);
         return interaction.reply({
             content: `📋 **Copy the script below** (Ctrl+A → Ctrl+C):\n\`\`\`${data.lang}\n${preview}${data.script.length > 1800 ? "\n...(use 👁️ View Full or ⬇️ Download for the complete script)" : ""}\n\`\`\``,
@@ -1362,8 +1479,9 @@ async function handleButtonInteraction(interaction) {
     }
 
     if (id.startsWith("script_download_")) {
-        const data = scriptStore.get(id.replace("script_download_", ""));
-        if (!data) return interaction.reply({ content: "❌ Script data expired — use the file attachment on the original announcement post instead.", ephemeral: true });
+        const scriptId = id.replace("script_download_", "");
+        const data = scriptStore.get(scriptId) || await db.getScript(scriptId);
+        if (!data) return interaction.reply({ content: "❌ Script data not found — use the file attachment on the original announcement post instead.", ephemeral: true });
         const extMap   = { javascript: "js", python: "py", typescript: "ts", txt: "txt" };
         const ext      = extMap[data.lang] || "lua";
         const filename = `${data.title.replace(/[^a-zA-Z0-9_\-]/g, "_").slice(0, 40)}.${ext}`;
@@ -1384,6 +1502,7 @@ async function handleButtonInteraction(interaction) {
         }
         await interaction.reply("🔒 Closing ticket in 3 seconds...");
         ticketChannels.delete(interaction.channelId);
+        db.closeTicket(interaction.channelId).catch(() => {});
         setTimeout(() => interaction.channel.delete().catch(() => {}), 3000);
         return;
     }
@@ -1396,6 +1515,7 @@ async function handleButtonInteraction(interaction) {
 async function postScriptAnnouncement(channel, { title, desc, script, lang, ytId, dlLink, authorTag }) {
     const scriptId  = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     scriptStore.set(scriptId, { script, lang, title });
+    db.saveScript(scriptId, channel.guild?.id ?? null, channel.id, title, lang, script).catch(() => {});
 
     const preview   = script.slice(0, 300);
     const hasMore   = script.length > 300;
@@ -1991,7 +2111,10 @@ client.on("messageCreate", async (message) => {
 
     // ── STEP 2 — XP ──
     if (!ticketChannels.has(message.channelId)) {
-        const result = addXP(message.author.id, XP_PER_MSG());
+        const result = addXP(message.author.id, XP_PER_MSG(), {
+            username:  message.author.tag,
+            avatarURL: message.author.displayAvatarURL({ dynamic: true }),
+        });
         if (result.leveled) {
             message.channel.send(`🎉 ${message.author} leveled up to **Level ${result.level}**! ⭐`).catch(() => {});
         }
@@ -2038,6 +2161,7 @@ client.on("messageCreate", async (message) => {
             const map = customCmds.get(guildId) || new Map();
             map.set(trigger, response);
             customCmds.set(guildId, map);
+            db.setCustomCommand(guildId, trigger, response).catch(() => {});
             return message.reply(`✅ \`!${trigger}\` added.`);
         }
         if (lower.startsWith("!removecmd ")) {
@@ -2045,6 +2169,7 @@ client.on("messageCreate", async (message) => {
             const map = customCmds.get(guildId);
             if (!map || !map.has(trigger)) return message.reply(`❌ No \`!${trigger}\`.`);
             map.delete(trigger);
+            db.removeCustomCommand(guildId, trigger).catch(() => {});
             return message.reply(`✅ Removed \`!${trigger}\`.`);
         }
         if (lower === "!listcmds") {
@@ -2060,12 +2185,12 @@ client.on("messageCreate", async (message) => {
             const target = message.mentions.members?.first();
             if (!target) return message.reply("❌ Mention a user.");
             const reason = content.replace(/^!warn\s+<@!?\d+>\s*/i, "").trim() || "No reason";
-            const warns  = addWarning(target.id, reason, message.author.tag);
+            const warns  = addWarning(target.id, reason, message.author.tag, guildId);
             await target.send(`⚠️ Warned in **${message.guild.name}**.\nReason: **${reason}**\nWarning #${warns.length}`).catch(() => {});
             return message.reply(`⚠️ ${target} warned (${warns.length} total).`);
         }
         if (lower.startsWith("!warnings "))      { const t = message.mentions.members?.first(); if (!t) return message.reply("❌ Mention a user."); const w = warnHistory.get(t.id) || []; if (!w.length) return message.reply("✅ No warnings."); return message.reply({ embeds: [buildWarningsEmbed(t.user, w)] }); }
-        if (lower.startsWith("!clearwarnings ")) { const t = message.mentions.members?.first(); if (!t) return message.reply("❌ Mention a user."); warnHistory.delete(t.id); return message.reply("✅ Cleared."); }
+        if (lower.startsWith("!clearwarnings ")) { const t = message.mentions.members?.first(); if (!t) return message.reply("❌ Mention a user."); warnHistory.delete(t.id); db.clearWarnings(t.id).catch(() => {}); return message.reply("✅ Cleared."); }
         if (lower.startsWith("!mute "))          { const t = message.mentions.members?.first(); if (!t) return message.reply("❌ Mention a user."); const r = content.replace(/^!mute\s+<@!?\d+>\s*/i, "").trim() || "Muted"; await t.timeout(28*24*60*60*1000, r); return message.reply(`🔇 ${t} muted.`); }
         if (lower.startsWith("!unmute "))        { const t = message.mentions.members?.first(); if (!t) return message.reply("❌ Mention a user."); await t.timeout(null); return message.reply(`🔊 ${t} unmuted.`); }
         if (lower.startsWith("!purge ")) {
@@ -2080,7 +2205,7 @@ client.on("messageCreate", async (message) => {
         if (lower.startsWith("!slowmode ")) { const s = parseInt(content.split(" ")[1]); if (isNaN(s) || s < 0 || s > 21600) return message.reply("❌ 0-21600"); await message.channel.setRateLimitPerUser(s); return message.reply(s === 0 ? "✅ Slowmode off." : `✅ Slowmode: ${s}s.`); }
         if (lower === "!lock")         { await message.channel.permissionOverwrites.edit(message.guild.roles.everyone, { SendMessages: false }); return message.reply("🔒 Locked."); }
         if (lower === "!unlock")       { await message.channel.permissionOverwrites.edit(message.guild.roles.everyone, { SendMessages: null });  return message.reply("🔓 Unlocked."); }
-        if (lower === "!closeticket")  { if (!ticketChannels.has(message.channelId)) return message.reply("❌ Not a ticket channel."); await message.reply("✅ Closing..."); setTimeout(() => message.channel.delete().catch(() => {}), 3000); ticketChannels.delete(message.channelId); return; }
+        if (lower === "!closeticket")  { if (!ticketChannels.has(message.channelId)) return message.reply("❌ Not a ticket channel."); await message.reply("✅ Closing..."); setTimeout(() => message.channel.delete().catch(() => {}), 3000); ticketChannels.delete(message.channelId); db.closeTicket(message.channelId).catch(() => {}); return; }
     }
 
     // PUBLIC PREFIX
@@ -2701,6 +2826,7 @@ async function createTicketChannel(guild, requester) {
         topic: `Support ticket for ${requester.user.tag} (${requester.id})`,
     });
     ticketChannels.add(ch.id);
+    db.openTicket(ch.id, guild.id, requester.id).catch(() => {});
 
     const closeRow = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId("ticket_close_btn").setLabel("🔒 Close Ticket").setStyle(ButtonStyle.Danger),
