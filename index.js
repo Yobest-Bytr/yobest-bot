@@ -22,8 +22,13 @@
 
 "use strict";
 
-// ====================== DATABASE ======================
+// ====================== DATABASE + HEARTBEAT ======================
 const db = require("./db");
+require("./heartbeat");
+
+// ====================== CONFIG CACHE (website sync) ======================
+const configCache = {};
+function getCfg(key, fallback = null) { return configCache[key] ?? fallback; }
 
 const {
     Client,
@@ -620,7 +625,7 @@ const slashCommands = [
         .setName("clearxp").setDescription("[Admin] Reset XP for a user")
         .addUserOption(o => o.setName("user").setDescription("Target user").setRequired(true)),
 
-    // GAME CATALOG
+    // GAME CATALOG (website integration)
     new SlashCommandBuilder()
         .setName("addgame").setDescription("[Admin] Add a game to the website catalog")
         .addStringOption(o => o.setName("title").setDescription("Game title").setRequired(true))
@@ -631,7 +636,7 @@ const slashCommands = [
         .setName("removegame").setDescription("[Admin] Remove a game from the website catalog")
         .addStringOption(o => o.setName("title").setDescription("Exact game title").setRequired(true)),
     new SlashCommandBuilder()
-        .setName("listgames").setDescription("[Admin] Show all games in the catalog"),
+        .setName("listgames").setDescription("[Admin] List all games in the website catalog"),
 
     // OWNER
     new SlashCommandBuilder().setName("scanandclean").setDescription("[Owner] Scan + clean last 100 messages"),
@@ -659,30 +664,31 @@ async function registerSlashCommands() {
 
 // ====================== READY ======================
 client.once("ready", async () => {
-    console.log(`✅ Yobest_BYTR Bot v4.7 Online — ${client.user.tag}`);
-    client.user.setActivity("🛡️ Protecting the server | v4.7", { type: 3 });
+    console.log(`✅ Yobest_BYTR Bot v4.8 Online — ${client.user.tag}`);
+    client.user.setActivity("🛡️ Protecting the server | v4.8", { type: 3 });
 
-    // ---- Neon: init schema + hydrate in-memory state ----
+    // ── Neon: init schema + hydrate all in-memory state ───────────────────────
     await db.initSchema();
     const state = await db.loadAllState();
 
-    // guild settings
+    // guild settings (re-wrap each in Proxy for auto-persist)
     for (const row of (state.guildSettings || [])) {
         const obj = {
             modRoleId:        row.mod_role_id,
             autoRoleId:       row.auto_role_id,
-            welcomeChannelId: row.welcome_channel || WELCOME_CHANNEL_ID,
-            goodbyeChannelId: row.goodbye_channel,
-            modlogChannelId:  row.modlog_channel  || MODLOG_CHANNEL_ID,
-            ticketCategoryId: row.ticket_category,
-            welcomeMessage:   row.welcome_message || welcomeMessage,
-            goodbyeMessage:   row.goodbye_message || goodbyeMessage,
+            welcomeChannelId: row.welcome_channel  || WELCOME_CHANNEL_ID,
+            goodbyeChannelId: row.goodbye_channel  || null,
+            modlogChannelId:  row.modlog_channel   || MODLOG_CHANNEL_ID,
+            ticketCategoryId: row.ticket_category  || null,
+            welcomeMessage:   row.welcome_message  || welcomeMessage,
+            goodbyeMessage:   row.goodbye_message  || goodbyeMessage,
         };
         guildSettings.set(row.guild_id, wrapSettings(row.guild_id, obj));
     }
     // XP
-    for (const row of (state.xp || [])) xpData.set(row.user_id, { xp: row.xp, level: row.level });
-    // warnings (rebuild warnHistory Map)
+    for (const row of (state.xp || []))
+        xpData.set(row.user_id, { xp: row.xp, level: row.level });
+    // warnings
     for (const row of (state.warnings || [])) {
         const w = warnHistory.get(row.user_id) || [];
         w.push({ reason: row.reason, ts: new Date(row.ts).getTime(), by: row.warned_by });
@@ -698,19 +704,80 @@ client.once("ready", async () => {
     for (const row of (state.reactionRoles || []))
         reactionRoles.set(`${row.guild_id}:${row.message_id}:${row.emoji}`, row.role_id);
     // open tickets
-    for (const channelId of (state.openTickets || [])) ticketChannels.add(channelId);
+    for (const channelId of (state.openTickets || []))
+        ticketChannels.add(channelId);
     // scripts
     for (const row of (state.scripts || []))
         scriptStore.set(row.script_id, { script: row.script, lang: row.lang, title: row.title });
+    // config cache
+    for (const [k, v] of Object.entries(state.config || {}))
+        configCache[k] = v;
 
-    console.log(`✅ Hydrated from Neon: ${(state.xp||[]).length} XP rows, ${(state.warnings||[]).length} warnings, ${(state.openTickets||[]).length} open tickets.`);
+    console.log(`✅ Hydrated from Neon: ${(state.xp||[]).length} XP, ${(state.warnings||[]).length} warnings, ${(state.openTickets||[]).length} tickets`);
 
-    // ---- snapshot guild stats immediately + every 5 min ----
+    // ── Guild stat snapshots: immediate + every 5 min ─────────────────────────
     const snapshotAll = () => {
-        for (const g of client.guilds.cache.values()) db.upsertGuildSnapshot(g).catch(() => {});
+        for (const g of client.guilds.cache.values())
+            db.upsertGuildSnapshot(g).catch(() => {});
     };
     snapshotAll();
-    setInterval(snapshotAll, 5 * 60 * 1000);
+    setInterval(snapshotAll, 5 * 60_000);
+
+    // ── Poll bot_config every 60s (picks up website changes) ─────────────────
+    async function refreshConfig() {
+        try {
+            const rows = await db.getAllConfig();
+            for (const row of rows) configCache[row.key] = row.value;
+        } catch {}
+    }
+    setInterval(refreshConfig, 60_000);
+
+    // ── Poll web_commands every 15s and execute them ──────────────────────────
+    async function execWebCommands() {
+        const cmds = await db.pollWebCommands();
+        for (const cmd of cmds) {
+            try {
+                const guild =
+                    client.guilds.cache.get(cmd.guild_id) ||
+                    await client.guilds.fetch(cmd.guild_id).catch(() => null);
+                if (!guild) { await db.ackWebCommand(cmd.id, "error", "Guild not found"); continue; }
+
+                switch (cmd.command) {
+                    case "announce": {
+                        const { channelId, message } = cmd.payload || {};
+                        const ch = guild.channels.cache.get(channelId);
+                        if (!ch) { await db.ackWebCommand(cmd.id, "error", "Channel not found"); break; }
+                        await ch.send(String(message || "(empty)"));
+                        await db.ackWebCommand(cmd.id, "done", "Sent");
+                        break;
+                    }
+                    case "snapshot_stats":
+                        await db.upsertGuildSnapshot(guild);
+                        await db.ackWebCommand(cmd.id, "done", "Snapshotted");
+                        break;
+                    case "sync_commands":
+                        await registerSlashCommands();
+                        await db.ackWebCommand(cmd.id, "done", "Slash commands re-synced");
+                        break;
+                    case "test_welcome": {
+                        const s  = getSettings(guild.id);
+                        const ch = guild.channels.cache.get(s.welcomeChannelId) || guild.systemChannel;
+                        if (ch) await ch.send("👋 Test welcome message from the web control panel!");
+                        await db.ackWebCommand(cmd.id, "done", "Sent test welcome");
+                        break;
+                    }
+                    case "prune_data":
+                        await db.ackWebCommand(cmd.id, "done", "Use Neon SQL: DELETE FROM guild_stats_history WHERE captured_at < NOW()-INTERVAL '7 days'");
+                        break;
+                    default:
+                        await db.ackWebCommand(cmd.id, "error", `Unknown command: ${cmd.command}`);
+                }
+            } catch (e) {
+                await db.ackWebCommand(cmd.id, "error", e.message).catch(() => {});
+            }
+        }
+    }
+    setInterval(execWebCommands, 15_000);
 
     await registerSlashCommands();
     await runStartupSelfTest();
@@ -726,9 +793,9 @@ async function runStartupSelfTest() {
         }
         if (!ch) return;
         const embed = new EmbedBuilder()
-            .setTitle("✅ Yobest Bot v4.7 — Online")
+            .setTitle("✅ Yobest Bot v4.8 — Online")
             .setColor(0x00FFAA)
-            .setDescription("v4.7 — Full agent permissions, owner /command, emoji channel names, large-script support.")
+            .setDescription("v4.8 — Neon DB persistence, website control panel, heartbeat, game catalog, config sync.")
             .addFields(
                 { name: "🛡️ Auto-Mod",        value: "✅ Instant regex + AI vision", inline: false },
                 { name: "🤬 Profanity",        value: `✅ ${PROFANITY_PATTERNS.length} patterns`, inline: true },
@@ -740,7 +807,7 @@ async function runStartupSelfTest() {
                 { name: "📜 Script Announcer", value: "✅ /announcescript — file upload supported", inline: false },
                 { name: "🧠 AI Model",         value: OPENROUTER_MODEL, inline: false },
             )
-            .setFooter({ text: "Yobest_BYTR Bot v4.7" })
+            .setFooter({ text: "Yobest_BYTR Bot v4.8" })
             .setTimestamp();
         await ch.send({ embeds: [embed] });
     } catch (e) { console.error("Startup self-test error:", e); }
@@ -1288,7 +1355,6 @@ client.on("interactionCreate", async (interaction) => {
             const map = customCmds.get(guild.id);
             if (!map || !map.has(trigger)) return replyErr(`No command \`!${trigger}\` found.`);
             map.delete(trigger);
-            db.removeCustomCommand(guild.id, trigger).catch(() => {});
             return reply(`✅ Removed \`!${trigger}\`.`);
         }
         if (commandName === "listcmds") {
@@ -1319,27 +1385,27 @@ client.on("interactionCreate", async (interaction) => {
         // ---- GAME CATALOG ----
         if (commandName === "addgame") {
             if (!requireLevel("admin", permLevel)) return replyErr("You need Admin or higher.");
+            if (!db.ready()) return replyErr("Database not configured — set `DATABASE_URL` to enable the game catalog.");
             const title = interaction.options.getString("title");
             const desc  = interaction.options.getString("description");
             const link  = interaction.options.getString("link");
             const image = interaction.options.getString("image");
-            if (!db.ready()) return replyErr("Database not configured — set DATABASE_URL to enable the game catalog.");
             await db.addGame(title, desc, link, image, member.user.tag);
-            return reply(`✅ **${title}** added to the website catalog.`);
+            return reply(`✅ **${title}** added to the website games page.`);
         }
         if (commandName === "removegame") {
             if (!requireLevel("admin", permLevel)) return replyErr("You need Admin or higher.");
-            const title = interaction.options.getString("title");
             if (!db.ready()) return replyErr("Database not configured.");
+            const title   = interaction.options.getString("title");
             const removed = await db.removeGame(title);
-            return removed ? reply(`✅ **${title}** removed from the catalog.`) : replyErr(`No game found with title **${title}**.`);
+            return removed ? reply(`✅ **${title}** removed from the catalog.`) : replyErr(`No game found: **${title}**`);
         }
         if (commandName === "listgames") {
             if (!requireLevel("admin", permLevel)) return replyErr("You need Admin or higher.");
             if (!db.ready()) return replyErr("Database not configured.");
             const games = await db.listGames();
             if (!games.length) return reply("No games in the catalog yet. Use `/addgame` to add one.");
-            const lines = games.map((g, i) => `**${i + 1}.** ${g.title} *(${g.status})* ${g.play_url ? `— [Play](${g.play_url})` : ""}`);
+            const lines = games.map((g, i) => `**${i+1}.** ${g.title} *(${g.status})* ${g.play_url ? `— [Play](${g.play_url})` : ""}`);
             return reply({ embeds: [new EmbedBuilder().setTitle("🎮 Game Catalog").setColor(0x00FFAA).setDescription(lines.join("\n")).setFooter({ text: "Manage with /addgame and /removegame" })] });
         }
 
@@ -1457,9 +1523,9 @@ async function handleButtonInteraction(interaction) {
     }
 
     if (id.startsWith("script_view_")) {
-        const scriptId = id.replace("script_view_", "");
-        let data = scriptStore.get(scriptId) || await db.getScript(scriptId);
-        if (!data) return interaction.reply({ content: "❌ Script data not found — use the download attachment on the announcement post instead.", ephemeral: true });
+        const scriptId_v = id.replace("script_view_", "");
+        const data = scriptStore.get(scriptId_v) || await db.getScript(scriptId_v);
+        if (!data) return interaction.reply({ content: "❌ Script data not found — use the download attachment on the announcement post instead).", ephemeral: true });
         const chunks = splitCode(data.script, 1900);
         await interaction.reply({ content: `📜 **Full Script** (${chunks.length} part${chunks.length > 1 ? "s" : ""}):\n\`\`\`${data.lang}\n${chunks[0]}\n\`\`\``, ephemeral: true });
         for (let i = 1; i < chunks.length; i++)
@@ -1468,8 +1534,8 @@ async function handleButtonInteraction(interaction) {
     }
 
     if (id.startsWith("script_copy_")) {
-        const scriptId = id.replace("script_copy_", "");
-        const data = scriptStore.get(scriptId) || await db.getScript(scriptId);
+        const scriptId_c = id.replace("script_copy_", "");
+        const data = scriptStore.get(scriptId_c) || await db.getScript(scriptId_c);
         if (!data) return interaction.reply({ content: "❌ Script data not found.", ephemeral: true });
         const preview = data.script.slice(0, 1800);
         return interaction.reply({
@@ -1479,9 +1545,9 @@ async function handleButtonInteraction(interaction) {
     }
 
     if (id.startsWith("script_download_")) {
-        const scriptId = id.replace("script_download_", "");
-        const data = scriptStore.get(scriptId) || await db.getScript(scriptId);
-        if (!data) return interaction.reply({ content: "❌ Script data not found — use the file attachment on the original announcement post instead.", ephemeral: true });
+        const scriptId_d = id.replace("script_download_", "");
+        const data = scriptStore.get(scriptId_d) || await db.getScript(scriptId_d);
+        if (!data) return interaction.reply({ content: "❌ Script not found — use the file attachment on the original announcement post instead.", ephemeral: true });
         const extMap   = { javascript: "js", python: "py", typescript: "ts", txt: "txt" };
         const ext      = extMap[data.lang] || "lua";
         const filename = `${data.title.replace(/[^a-zA-Z0-9_\-]/g, "_").slice(0, 40)}.${ext}`;
@@ -1978,7 +2044,7 @@ async function executeOwnerActions(actions, guild, channel) {
                     const member = await guild.members.fetch(action.user_id).catch(() => null);
                     if (!member) { results.push(`⚠️ Member ${action.user_id} not found`); break; }
                     const reason = action.reason || "Warned via /command";
-                    const warns  = addWarning(member.id, reason, "Server Owner");
+                    const warns  = addWarning(member.id, reason, "Server Owner", guild.id);
                     await member.send(`⚠️ You were **warned** in **${guild.name}**.\nReason: **${reason}**`).catch(() => {});
                     results.push(`Warned ${member.user.tag} (#${warns.length}) — ${reason}`);
                     break;
@@ -2111,10 +2177,7 @@ client.on("messageCreate", async (message) => {
 
     // ── STEP 2 — XP ──
     if (!ticketChannels.has(message.channelId)) {
-        const result = addXP(message.author.id, XP_PER_MSG(), {
-            username:  message.author.tag,
-            avatarURL: message.author.displayAvatarURL({ dynamic: true }),
-        });
+        const result = addXP(message.author.id, XP_PER_MSG(), { username: message.author.tag, avatarURL: message.author.displayAvatarURL({ dynamic: true }) });
         if (result.leveled) {
             message.channel.send(`🎉 ${message.author} leveled up to **Level ${result.level}**! ⭐`).catch(() => {});
         }
@@ -2169,7 +2232,6 @@ client.on("messageCreate", async (message) => {
             const map = customCmds.get(guildId);
             if (!map || !map.has(trigger)) return message.reply(`❌ No \`!${trigger}\`.`);
             map.delete(trigger);
-            db.removeCustomCommand(guildId, trigger).catch(() => {});
             return message.reply(`✅ Removed \`!${trigger}\`.`);
         }
         if (lower === "!listcmds") {
@@ -2185,7 +2247,7 @@ client.on("messageCreate", async (message) => {
             const target = message.mentions.members?.first();
             if (!target) return message.reply("❌ Mention a user.");
             const reason = content.replace(/^!warn\s+<@!?\d+>\s*/i, "").trim() || "No reason";
-            const warns  = addWarning(target.id, reason, message.author.tag, guildId);
+            const warns  = addWarning(target.id, reason, message.author.tag, message.guild?.id);
             await target.send(`⚠️ Warned in **${message.guild.name}**.\nReason: **${reason}**\nWarning #${warns.length}`).catch(() => {});
             return message.reply(`⚠️ ${target} warned (${warns.length} total).`);
         }
@@ -2279,7 +2341,7 @@ client.on("messageCreate", async (message) => {
     }
 
     // AI Chat
-    if (aiEnabledChannels.has(message.channel.id)) {
+    if (aiEnabledChannels.has(message.channel.id) && getCfg("ai_enabled","true") === "true") {
         const triggers = ["yobest","bot","script","code","site","website","hello","hi","help","roblox","lua"];
         if (message.mentions.has(client.user) || triggers.some(t => lower.includes(t))) {
             const thinking = await message.reply("🤔 **Yobest is thinking...**");
@@ -2481,12 +2543,15 @@ async function classifyImageWithAI(url) {
 async function getAIResponse(message) {
     if (!openaiClient) return "⚠️ AI is not configured — set `OPENROUTER_API_KEY`.";
     const userInput    = message.content.replace(/<@!?[0-9]+>/g, "").trim() || "Hello";
-    const systemPrompt =
+    // Use system prompt from website control panel if set, otherwise use default
+    const systemPrompt = getCfg("ai_system_prompt") ||
         `You are ${AI_DISPLAY_NAME}, a friendly Roblox Lua scripting expert and Discord bot for ${SITE_INFO.name}.\n` +
         `About the site: ${SITE_INFO.description}\n\n` +
         `Rules: Respond in English. For Lua/Roblox scripts write complete code in a \`\`\`lua block. ` +
         `For site questions refer to ${SITE_INFO.url}. Keep replies concise and friendly.`;
-    const models = [OPENROUTER_MODEL, OPENROUTER_FALLBACK];
+    // Use model from website control panel if set, otherwise use default
+    const activeModel = getCfg("ai_model") || OPENROUTER_MODEL;
+    const models = [activeModel, OPENROUTER_FALLBACK].filter((v,i,a) => a.indexOf(v)===i);
     for (const model of models) {
         try {
             const c    = await openaiClient.chat.completions.create({ model, messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userInput }], max_tokens: 600, temperature: 0.7 });
@@ -2533,7 +2598,7 @@ async function applyTimeout(message, reason, category, evidenceUrl) {
         const count  = (violationCount.get(userId) || 0) + 1;
         violationCount.set(userId, count);
 
-        const warns = addWarning(userId, `[Auto-mod: ${category}] ${reason}`, "AutoMod");
+        const warns = addWarning(userId, `[Auto-mod: ${category}] ${reason}`, "AutoMod", message.guild?.id);
 
         let action = "Warned";
         let member = null;
@@ -2606,7 +2671,7 @@ async function doScanAndClean(channel) {
                 await msg.delete().catch(() => {});
                 deleted++;
                 violationCount.set(msg.author.id, (violationCount.get(msg.author.id) || 0) + 1);
-                addWarning(msg.author.id, `[ScanAndClean] ${reason}`, "AutoMod");
+                addWarning(msg.author.id, `[ScanAndClean] ${reason}`, "AutoMod", guild.id);
             }
         }
 
@@ -3015,7 +3080,7 @@ function buildHelpEmbed(permLevel) {
     if (requireLevel("admin", permLevel)) {
         embed.addFields({
             name: "👑 Admin+",
-            value: "`/ban` `/kick` `/announce` `/giveaway` `/announcescript` `/generate` `/agent` `/agentclear` `/setwelcome` `/setgoodbyemsg` `/setmodrole` `/setautorole` `/setwelcomechannel` `/setgoodbyechannel` `/setmodlogchannel` `/setticketcategory` `/enableai` `/disableai` `/addcmd` `/removecmd` `/listcmds` `/reactionrole` `/clearxp`",
+            value: "`/ban` `/kick` `/announce` `/giveaway` `/announcescript` `/generate` `/agent` `/agentclear` `/setwelcome` `/setgoodbyemsg` `/setmodrole` `/setautorole` `/setwelcomechannel` `/setgoodbyechannel` `/setmodlogchannel` `/setticketcategory` `/enableai` `/disableai` `/addcmd` `/removecmd` `/listcmds` `/reactionrole` `/clearxp` `/addgame` `/removegame` `/listgames`",
             inline: false,
         });
     }
