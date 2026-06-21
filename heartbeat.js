@@ -1,32 +1,26 @@
 "use strict";
+// Writes a fresh timestamp to Neon every 30s.
+// The website reads this same table (lib/db.js -> isBotOnline()) to show Online/Offline.
 
-/**
- * heartbeat.js
- * Pings the website /api/bot-status every 30 seconds so the site can
- * distinguish "bot truly online" from "bot offline with stale DB data".
- *
- * Usage — add ONE line at the top of index.js (after const db = require("./db")):
- *   require("./heartbeat");
- */
+const { neon } = require("@neondatabase/serverless");
 
-const INTERVAL_MS = 30_000;
-const URL         = process.env.WEBSITE_URL     || "https://yobest-bot-system.vercel.app";
-const SECRET      = process.env.HEARTBEAT_SECRET || "";
+const sql = process.env.DATABASE_URL ? neon(process.env.DATABASE_URL) : null;
 
-async function ping() {
+async function beat() {
+  if (!sql) {
+    console.warn("[heartbeat] DATABASE_URL not set — skipping.");
+    return;
+  }
   try {
-    const res = await fetch(`${URL}/api/bot-status`, {
-      method:  "POST",
-      headers: { "Content-Type": "application/json", "x-heartbeat-secret": SECRET },
-      body:    JSON.stringify({ ts: Date.now() }),
-      signal:  AbortSignal.timeout(8_000),
-    });
-    if (!res.ok) console.warn(`[heartbeat] HTTP ${res.status}`);
+    await sql`CREATE TABLE IF NOT EXISTS bot_heartbeat (ts TIMESTAMPTZ NOT NULL)`;
+    await sql`DELETE FROM bot_heartbeat`;
+    await sql`INSERT INTO bot_heartbeat (ts) VALUES (NOW())`;
   } catch (e) {
-    console.warn("[heartbeat] ping failed:", e.message);
+    console.error("[heartbeat] write failed:", e.message);
   }
 }
 
-ping();
-setInterval(ping, INTERVAL_MS);
-console.log(`[heartbeat] pinging ${URL} every ${INTERVAL_MS / 1000}s`);
+beat();                     // write one immediately on startup
+setInterval(beat, 30_000);   // then every 30s
+
+module.exports = {};
