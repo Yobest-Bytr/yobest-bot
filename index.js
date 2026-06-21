@@ -663,7 +663,7 @@ async function registerSlashCommands() {
 }
 
 // ====================== READY ======================
-client.once("ready", async () => {
+client.once("clientReady", async () => {
     console.log(`✅ Yobest_BYTR Bot v4.8 Online — ${client.user.tag}`);
     client.user.setActivity("🛡️ Protecting the server | v4.8", { type: 3 });
 
