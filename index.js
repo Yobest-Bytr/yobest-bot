@@ -1,22 +1,29 @@
 /**
- * Yobest_BYTR Discord Bot  ·  v4.7 — AI SERVER BUILDER + SCRIPT ANNOUNCER + OWNER CONTROL
+ * Yobest_BYTR Discord Bot  ·  v4.8.1 — BUG FIXES + WEBSITE LINK
  * ==========================================================================================
- * WHAT'S NEW IN v4.7
+ * WHAT'S NEW IN v4.8.1
  * ------------------------------------------------------------------------------------------
  *
- *  ✅ FIX: Channel name sanitizer — emoji are now preserved (was stripping all non-a-z0-9)
- *  ✅ FIX: /announcescript now accepts a `file` attachment option for unlimited-size scripts
- *          AND always attaches the full script as a downloadable file on the announcement post
- *  ✅ FIX: AI agent now has FULL Discord permissions:
- *          - set_channel_permission (ACL overwrites per role)
- *          - move_channel (set parent category)
- *          - set_channel_topic / set_channel_nsfw / set_channel_slowmode
- *          - set_role_color / set_role_hoist / set_role_mentionable / set_role_permissions
- *  ✅ NEW: /command — Owner natural language control
- *          - Free-form instruction: "ban @Marco for spam", "give @Alex the Mod role"
- *          - Resolves @mentions and usernames to real member IDs
- *          - ALL destructive actions (ban/kick/purge/delete) require a confirm button click
- *  ✅ All v4.6 features fully preserved
+ *  🐛 FIX: /scanandclean crashed with ReferenceError after the first flagged message
+ *          ('guild' was never in scope inside doScanAndClean — changed to channel.guild)
+ *
+ *  🐛 FIX: /removecmd and !removecmd only deleted commands from memory, not from Neon DB.
+ *          Deleted commands would reappear after every bot restart. Now calls
+ *          db.removeCustomCommand() so the deletion actually persists.
+ *
+ *  🐛 FIX: Website control-panel toggles for automod_enabled, xp_enabled, and
+ *          welcome_enabled were seeded into bot_config but never actually read by the bot.
+ *          Only ai_enabled was wired up. All four toggles now work correctly.
+ *
+ *  ✅ CHANGE: Bot no longer auto-deletes messages for having a flagged file extension.
+ *          Instead it posts a mod-log alert so moderators can review. The message and
+ *          the user are left untouched (no deletion, no timeout).
+ *
+ *  ✅ FIX: heartbeat.js now also HTTP-POSTs to WEBSITE_URL/api/heartbeat with
+ *          HEARTBEAT_SECRET — the env vars that bot_env.example promised but were never
+ *          actually used. The DB write still happens too.
+ *
+ *  ✅ All v4.8 features fully preserved
  * ==========================================================================================
  */
 
@@ -823,7 +830,7 @@ client.on("guildMemberAdd", async (member) => {
             if (role) await member.roles.add(role).catch(() => {});
         }
         const ch = member.guild.channels.cache.get(s.welcomeChannelId) || member.guild.systemChannel;
-        if (!ch) return;
+        if (!ch || getCfg("welcome_enabled", "true") !== "true") return;
         const desc = (s.welcomeMessage || welcomeMessage)
             .replace(/{user}/g,   `${member}`)
             .replace(/{server}/g, member.guild.name)
@@ -1355,6 +1362,7 @@ client.on("interactionCreate", async (interaction) => {
             const map = customCmds.get(guild.id);
             if (!map || !map.has(trigger)) return replyErr(`No command \`!${trigger}\` found.`);
             map.delete(trigger);
+            db.removeCustomCommand(guild.id, trigger).catch(() => {});
             return reply(`✅ Removed \`!${trigger}\`.`);
         }
         if (commandName === "listcmds") {
@@ -2134,7 +2142,7 @@ client.on("messageCreate", async (message) => {
     const guildId   = message.guild.id;
 
     // ── STEP 1 — AUTO-MOD ──
-    if (!isMod) {
+    if (!isMod && getCfg("automod_enabled", "true") === "true") {
         const spamResult = checkSpam(message.author.id);
         if (spamResult.flagged) {
             await safeDelete(message);
@@ -2165,9 +2173,20 @@ client.on("messageCreate", async (message) => {
 
         for (const f of getFileAttachments(message)) {
             if (DANGEROUS_EXTS.test(f.name)) {
-                await safeDelete(message);
-                await applyTimeout(message, `Dangerous file blocked: \`${f.name}\``, "file", null);
-                return;
+                // Alert mods — do NOT delete the message or punish the user automatically.
+                const alertEmbed = new EmbedBuilder()
+                    .setTitle("⚠️ Flagged File Attachment")
+                    .setColor(0xFF8800)
+                    .addFields(
+                        { name: "User",    value: `${message.author.tag} (${message.author.id})`, inline: true },
+                        { name: "Channel", value: `${message.channel}`, inline: true },
+                        { name: "File",    value: `\`${f.name}\``, inline: false },
+                        { name: "Note",    value: "File extension is on the watch-list. No action was taken automatically — please review.", inline: false },
+                    )
+                    .setTimestamp();
+                logToModChannel(message.guild, alertEmbed).catch(() => {});
+                // Do not return — continue processing XP / other steps normally.
+                break;
             }
         }
 
@@ -2176,7 +2195,7 @@ client.on("messageCreate", async (message) => {
     }
 
     // ── STEP 2 — XP ──
-    if (!ticketChannels.has(message.channelId)) {
+    if (!ticketChannels.has(message.channelId) && getCfg("xp_enabled", "true") === "true") {
         const result = addXP(message.author.id, XP_PER_MSG(), { username: message.author.tag, avatarURL: message.author.displayAvatarURL({ dynamic: true }) });
         if (result.leveled) {
             message.channel.send(`🎉 ${message.author} leveled up to **Level ${result.level}**! ⭐`).catch(() => {});
@@ -2232,6 +2251,7 @@ client.on("messageCreate", async (message) => {
             const map = customCmds.get(guildId);
             if (!map || !map.has(trigger)) return message.reply(`❌ No \`!${trigger}\`.`);
             map.delete(trigger);
+            db.removeCustomCommand(guildId, trigger).catch(() => {});
             return message.reply(`✅ Removed \`!${trigger}\`.`);
         }
         if (lower === "!listcmds") {
@@ -2671,7 +2691,7 @@ async function doScanAndClean(channel) {
                 await msg.delete().catch(() => {});
                 deleted++;
                 violationCount.set(msg.author.id, (violationCount.get(msg.author.id) || 0) + 1);
-                addWarning(msg.author.id, `[ScanAndClean] ${reason}`, "AutoMod", guild.id);
+                addWarning(msg.author.id, `[ScanAndClean] ${reason}`, "AutoMod", channel.guild.id);
             }
         }
 
