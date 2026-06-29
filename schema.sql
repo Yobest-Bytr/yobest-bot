@@ -1,4 +1,4 @@
--- Yobest Studio · Neon schema v2
+-- Yobest Studio · Neon schema v3
 -- Safe to re-run — every statement is idempotent.
 
 -- ── Existing tables ────────────────────────────────────────────────────────────
@@ -96,3 +96,24 @@ CREATE TABLE IF NOT EXISTS web_commands (
   executed_at TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS web_commands_pending ON web_commands(status,created_at) WHERE status='pending';
+
+-- ── New v3 additions ───────────────────────────────────────────────────────────
+
+-- Extra guild_settings columns: ticket log/panel channel + naming, Roblox updates channel
+ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS ticket_log_channel TEXT;
+ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS ticket_panel_channel TEXT;
+ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS ticket_name_prefix TEXT DEFAULT 'ticket';
+ALTER TABLE guild_settings ADD COLUMN IF NOT EXISTS roblox_updates_channel TEXT;
+
+-- Additional mod roles per guild (on top of the single legacy mod_role_id)
+CREATE TABLE IF NOT EXISTS guild_mod_roles (
+  guild_id TEXT NOT NULL, role_id TEXT NOT NULL,
+  PRIMARY KEY (guild_id, role_id)
+);
+
+-- Per-command permission overrides — lets admins raise/lower the tier required
+-- for any individual slash command, per guild (e.g. let Mods use /announce).
+CREATE TABLE IF NOT EXISTS command_permissions (
+  guild_id TEXT NOT NULL, command TEXT NOT NULL, min_level TEXT NOT NULL,
+  PRIMARY KEY (guild_id, command)
+);

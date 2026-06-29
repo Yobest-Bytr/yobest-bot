@@ -50,7 +50,7 @@ async function initSchema() {
 // ── Hydrate in-memory state on startup ────────────────────────────────────────
 async function loadAllState() {
   if (!pool) return {};
-  const [settings, xp, warnings, cmds, rxRoles, tickets, scripts, config] = await Promise.all([
+  const [settings, xp, warnings, cmds, rxRoles, tickets, scripts, config, modRoles, cmdPerms] = await Promise.all([
     q("SELECT * FROM guild_settings"),
     q("SELECT * FROM xp"),
     q("SELECT * FROM warnings ORDER BY ts ASC"),
@@ -59,6 +59,8 @@ async function loadAllState() {
     q("SELECT channel_id FROM tickets WHERE status='open'"),
     q("SELECT script_id,title,lang,script FROM scripts"),
     q("SELECT key,value FROM bot_config"),
+    q("SELECT guild_id,role_id FROM guild_mod_roles"),
+    q("SELECT guild_id,command,min_level FROM command_permissions"),
   ]);
   return {
     guildSettings:  settings.rows,
@@ -69,6 +71,8 @@ async function loadAllState() {
     openTickets:    tickets.rows.map((r) => r.channel_id),
     scripts:        scripts.rows,
     config:         Object.fromEntries(config.rows.map((r) => [r.key, r.value])),
+    modRoles:       modRoles.rows,
+    commandPerms:   cmdPerms.rows,
   };
 }
 
@@ -76,14 +80,35 @@ async function loadAllState() {
 async function saveGuildSettings(guildId, s) {
   await q(`INSERT INTO guild_settings
     (guild_id,mod_role_id,auto_role_id,welcome_channel,goodbye_channel,
-     modlog_channel,ticket_category,welcome_message,goodbye_message,updated_at)
-   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
+     modlog_channel,ticket_category,welcome_message,goodbye_message,
+     ticket_log_channel,ticket_panel_channel,ticket_name_prefix,roblox_updates_channel,updated_at)
+   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW())
    ON CONFLICT (guild_id) DO UPDATE SET
      mod_role_id=$2,auto_role_id=$3,welcome_channel=$4,goodbye_channel=$5,
-     modlog_channel=$6,ticket_category=$7,welcome_message=$8,goodbye_message=$9,updated_at=NOW()`,
+     modlog_channel=$6,ticket_category=$7,welcome_message=$8,goodbye_message=$9,
+     ticket_log_channel=$10,ticket_panel_channel=$11,ticket_name_prefix=$12,roblox_updates_channel=$13,updated_at=NOW()`,
   [guildId,s.modRoleId??null,s.autoRoleId??null,s.welcomeChannelId??null,
    s.goodbyeChannelId??null,s.modlogChannelId??null,s.ticketCategoryId??null,
-   s.welcomeMessage??null,s.goodbyeMessage??null]);
+   s.welcomeMessage??null,s.goodbyeMessage??null,
+   s.ticketLogChannelId??null,s.ticketPanelChannelId??null,s.ticketNamePrefix??null,s.robloxUpdatesChannelId??null]);
+}
+
+// ── Mod roles (additional, beyond the single legacy mod_role_id) ──────────────
+async function addModRole(guildId, roleId) {
+  await q(`INSERT INTO guild_mod_roles (guild_id,role_id) VALUES ($1,$2)
+   ON CONFLICT (guild_id,role_id) DO NOTHING`, [guildId, roleId]);
+}
+async function removeModRole(guildId, roleId) {
+  await q("DELETE FROM guild_mod_roles WHERE guild_id=$1 AND role_id=$2", [guildId, roleId]);
+}
+
+// ── Per-command permission overrides ──────────────────────────────────────────
+async function setCommandPermission(guildId, command, minLevel) {
+  await q(`INSERT INTO command_permissions (guild_id,command,min_level) VALUES ($1,$2,$3)
+   ON CONFLICT (guild_id,command) DO UPDATE SET min_level=$3`, [guildId, command, minLevel]);
+}
+async function removeCommandPermission(guildId, command) {
+  await q("DELETE FROM command_permissions WHERE guild_id=$1 AND command=$2", [guildId, command]);
 }
 
 // ── XP ─────────────────────────────────────────────────────────────────────────
@@ -164,6 +189,10 @@ async function listGames() {
   const { rows } = await q("SELECT title,description,play_url,image_url,status FROM games ORDER BY created_at DESC");
   return rows;
 }
+async function getGame(title) {
+  const { rows } = await q("SELECT * FROM games WHERE title=$1", [title]);
+  return rows[0] ?? null;
+}
 
 // ── Guild snapshot ─────────────────────────────────────────────────────────────
 async function upsertGuildSnapshot(guild) {
@@ -212,13 +241,15 @@ async function ackWebCommand(id, status, result = null) {
 module.exports = {
   ready, initSchema, loadAllState,
   saveGuildSettings,
+  addModRole, removeModRole,
+  setCommandPermission, removeCommandPermission,
   saveXP, clearXP,
   saveWarning, clearWarnings,
   setCustomCommand, removeCustomCommand,
   addReactionRole,
   openTicket, closeTicket,
   saveScript, getScript,
-  addGame, removeGame, listGames,
+  addGame, removeGame, listGames, getGame,
   upsertGuildSnapshot,
   writeHeartbeat,
   getConfig, setConfig, getAllConfig,

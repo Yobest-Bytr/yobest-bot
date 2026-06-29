@@ -1,0 +1,21 @@
+# ── Discord ────────────────────────────────────────────────────────────────────
+DISCORD_TOKEN=YOUR_BOT_TOKEN
+CLIENT_ID=1456027240977399818
+
+# ── AI via OpenRouter ──────────────────────────────────────────────────────────
+OPENROUTER_API_KEY=YOUR_OPENROUTER_KEY
+
+# ── Neon Postgres (POOLED connection string) ───────────────────────────────────
+DATABASE_URL=postgresql://user:pass@ep-xxx-pooler.region.aws.neon.tech/neondb?sslmode=require
+
+# ── Website heartbeat ──────────────────────────────────────────────────────────
+WEBSITE_URL=https://yobest-bot-system.vercel.app
+HEARTBEAT_SECRET=same_random_string_as_website
+
+# ── Optional fallbacks (overridden by Neon guild_settings) ─────────────────────
+WELCOME_CHANNEL_ID=
+MODLOG_CHANNEL_ID=
+
+# ── Roblox version tracker (optional) ──────────────────────────────────────────
+# How often (ms) to poll Roblox's client-version endpoints. Default: 600000 (10 min).
+ROBLOX_POLL_INTERVAL_MS=600000

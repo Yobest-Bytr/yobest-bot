@@ -1,27 +1,36 @@
 /**
- * Yobest_BYTR Discord Bot  ·  v4.8.1 — BUG FIXES + WEBSITE LINK
+ * Yobest_BYTR Discord Bot  ·  v5.0.0 — SETTINGS, TICKETS, PERMISSIONS, ROBLOX TRACKER
  * ==========================================================================================
- * WHAT'S NEW IN v4.8.1
+ * WHAT'S NEW IN v5.0.0
  * ------------------------------------------------------------------------------------------
  *
- *  🐛 FIX: /scanandclean crashed with ReferenceError after the first flagged message
- *          ('guild' was never in scope inside doScanAndClean — changed to channel.guild)
+ *  ✨ NEW: /settings — one consolidated command group replaces the old scattered
+ *          /setwelcome, /setmodrole, /setticketcategory, etc. Includes /settings view
+ *          for an at-a-glance embed of every current setting.
  *
- *  🐛 FIX: /removecmd and !removecmd only deleted commands from memory, not from Neon DB.
- *          Deleted commands would reappear after every bot restart. Now calls
- *          db.removeCustomCommand() so the deletion actually persists.
+ *  ✨ NEW: Ticket system upgrade — /ticketpanel posts a button members can click to
+ *          open a ticket in any channel you choose; tickets can use a custom name
+ *          prefix (/settings ticketnameprefix); closed tickets are logged to a channel
+ *          of your choice (/settings ticketlogchannel).
  *
- *  🐛 FIX: Website control-panel toggles for automod_enabled, xp_enabled, and
- *          welcome_enabled were seeded into bot_config but never actually read by the bot.
- *          Only ai_enabled was wired up. All four toggles now work correctly.
+ *  ✨ NEW: Granular permissions — admins can add extra moderator roles
+ *          (/settings addmodrole) on top of the single legacy mod role, and override
+ *          the tier required for any individual command (/settings commandperm).
  *
- *  ✅ CHANGE: Bot no longer auto-deletes messages for having a flagged file extension.
- *          Instead it posts a mod-log alert so moderators can review. The message and
- *          the user are left untouched (no deletion, no timeout).
+ *  ✨ NEW: Roblox version tracker (/roblox) — polls Roblox's public client-version
+ *          endpoints and posts an announcement to a channel you configure whenever a
+ *          new Roblox Client or Roblox Studio version ships.
  *
- *  ✅ FIX: heartbeat.js now also HTTP-POSTs to WEBSITE_URL/api/heartbeat with
- *          HEARTBEAT_SECRET — the env vars that bot_env.example promised but were never
- *          actually used. The DB write still happens too.
+ *  ✨ NEW: /games and /sharegame — browse the website's game catalog with an
+ *          interactive dropdown, or post a rich showcase (image + Play button) for a
+ *          single game so members can find it.
+ *
+ *  ✨ NEW: /help is now interactive — a category dropdown instead of one giant wall
+ *          of commands, shown privately (ephemeral) to whoever ran it.
+ *
+ *  ✨ NEW: AI chat now remembers the last few exchanges per user/channel (clear it
+ *          anytime with /aiforget), the system prompt carries richer context, and a
+ *          native Discord typing indicator replaces the old "thinking..." message.
  *
  *  ✅ All v4.8 features fully preserved
  * ==========================================================================================
@@ -44,6 +53,7 @@ const {
     ActionRowBuilder,
     ButtonBuilder,
     ButtonStyle,
+    StringSelectMenuBuilder,
     PermissionFlagsBits,
     REST,
     Routes,
@@ -108,6 +118,17 @@ const pendingBuilds       = new Map();   // interactionId → { plan, userId, pr
 const pendingAgentActions = new Map();  // token → { actions, userId, guildId }
 const pendingOwnerActions = new Map();  // token → { actions, userId, guildId, channelId }
 const scriptStore        = new Map();   // scriptId → { script, lang, title }
+const extraModRoles      = new Map();   // guildId → Set<roleId> (additional mod roles, beyond modRoleId)
+const commandPerms       = new Map();   // guildId → Map<command, minLevel> (per-command permission overrides)
+const aiChatHistory      = new Map();   // "channelId:userId" → { history: [{role,content}], last: timestamp }
+
+const AI_HISTORY_MAX_TURNS = 6;          // remembered exchanges per user/channel
+const AI_HISTORY_IDLE_MS   = 30 * 60_000; // memory resets after 30 min of inactivity
+const ROBLOX_POLL_INTERVAL_MS = parseInt(process.env.ROBLOX_POLL_INTERVAL_MS) || 10 * 60_000;
+const ROBLOX_VERSION_ENDPOINTS = {
+    client: "https://clientsettingscdn.roblox.com/v2/client-version/WindowsPlayer",
+    studio: "https://clientsettingscdn.roblox.com/v2/client-version/WindowsStudio64",
+};
 
 const startTime          = Date.now();
 const WELCOME_CHANNEL_ID = process.env.WELCOME_CHANNEL_ID || null;
@@ -319,6 +340,10 @@ function getSettings(guildId) {
             ticketCategoryId: null,
             welcomeMessage,
             goodbyeMessage,
+            ticketLogChannelId:     null,
+            ticketPanelChannelId:   null,
+            ticketNamePrefix:       "ticket",
+            robloxUpdatesChannelId: null,
         };
         guildSettings.set(guildId, wrapSettings(guildId, obj));
     }
@@ -331,12 +356,25 @@ function getPermLevel(member, guild) {
     if (member.permissions.has(PermissionFlagsBits.Administrator)) return "admin";
     const s = getSettings(guild.id);
     if (s.modRoleId && member.roles.cache.has(s.modRoleId))       return "mod";
+    const extra = extraModRoles.get(guild.id);
+    if (extra) for (const roleId of extra) if (member.roles.cache.has(roleId)) return "mod";
     return "member";
 }
 
 function requireLevel(needed, actual) {
     const order = ["member", "mod", "admin", "owner"];
     return order.indexOf(actual) >= order.indexOf(needed);
+}
+
+// Per-command permission overrides — admins can raise/lower the tier required
+// for an individual command via /settings commandperm. Falls back to the
+// command's normal default tier when no override exists.
+function getCommandOverride(guildId, command) {
+    return commandPerms.get(guildId)?.get(command) ?? null;
+}
+function checkPerm(command, fallbackLevel, actualLevel, guildId) {
+    const override = getCommandOverride(guildId, command);
+    return requireLevel(override || fallbackLevel, actualLevel);
 }
 
 function parseTime(str) {
@@ -588,29 +626,55 @@ const slashCommands = [
         .addStringOption(o => o.setName("time").setDescription("Duration e.g. 10m or 1h").setRequired(true))
         .addStringOption(o => o.setName("prize").setDescription("Prize description").setRequired(true)),
     new SlashCommandBuilder()
-        .setName("setwelcome").setDescription("[Admin] Set the welcome message")
-        .addStringOption(o => o.setName("message").setDescription("Use {user} {server} {count}").setRequired(true)),
+        .setName("settings").setDescription("[Admin] View or change bot settings for this server")
+        .addSubcommand(sc => sc.setName("view").setDescription("Show all current settings"))
+        .addSubcommand(sc => sc.setName("welcomemessage").setDescription("Set the welcome message")
+            .addStringOption(o => o.setName("message").setDescription("Use {user} {server} {count}").setRequired(true)))
+        .addSubcommand(sc => sc.setName("goodbyemessage").setDescription("Set the goodbye message")
+            .addStringOption(o => o.setName("message").setDescription("Use {username} {server} {count}").setRequired(true)))
+        .addSubcommand(sc => sc.setName("welcomechannel").setDescription("Set the welcome channel")
+            .addChannelOption(o => o.setName("channel").setDescription("Welcome channel").setRequired(true).addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)))
+        .addSubcommand(sc => sc.setName("goodbyechannel").setDescription("Set the goodbye/leave channel")
+            .addChannelOption(o => o.setName("channel").setDescription("Goodbye channel").setRequired(true).addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)))
+        .addSubcommand(sc => sc.setName("modlogchannel").setDescription("Set the mod-log channel")
+            .addChannelOption(o => o.setName("channel").setDescription("Mod-log channel").setRequired(true).addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)))
+        .addSubcommand(sc => sc.setName("autorole").setDescription("Auto-assign role on join")
+            .addRoleOption(o => o.setName("role").setDescription("Role to auto-assign").setRequired(true)))
+        .addSubcommand(sc => sc.setName("modrole").setDescription("Set the primary moderator role")
+            .addRoleOption(o => o.setName("role").setDescription("Moderator role").setRequired(true)))
+        .addSubcommand(sc => sc.setName("addmodrole").setDescription("Add an additional moderator role")
+            .addRoleOption(o => o.setName("role").setDescription("Role to grant Mod permissions").setRequired(true)))
+        .addSubcommand(sc => sc.setName("removemodrole").setDescription("Remove an additional moderator role")
+            .addRoleOption(o => o.setName("role").setDescription("Role to remove from Mod permissions").setRequired(true)))
+        .addSubcommand(sc => sc.setName("ticketcategory").setDescription("Set the category new ticket channels are created under")
+            .addChannelOption(o => o.setName("category").setDescription("Category channel").setRequired(true).addChannelTypes(ChannelType.GuildCategory)))
+        .addSubcommand(sc => sc.setName("ticketlogchannel").setDescription("Set the channel closed tickets are logged to")
+            .addChannelOption(o => o.setName("channel").setDescription("Ticket log channel").setRequired(true).addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)))
+        .addSubcommand(sc => sc.setName("ticketnameprefix").setDescription("Set the prefix used for new ticket channel names")
+            .addStringOption(o => o.setName("prefix").setDescription("e.g. \"ticket\" → #ticket-username").setRequired(true)))
+        .addSubcommand(sc => sc.setName("robloxchannel").setDescription("Set the channel for Roblox/Roblox Studio version update announcements")
+            .addChannelOption(o => o.setName("channel").setDescription("Roblox updates channel").setRequired(true).addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)))
+        .addSubcommand(sc => sc.setName("toggle").setDescription("Turn a bot feature on or off")
+            .addStringOption(o => o.setName("feature").setDescription("Feature to toggle").setRequired(true)
+                .addChoices({ name: "Auto-mod", value: "automod_enabled" }, { name: "XP system", value: "xp_enabled" }, { name: "Welcome messages", value: "welcome_enabled" }, { name: "AI (global)", value: "ai_enabled" }))
+            .addStringOption(o => o.setName("value").setDescription("on or off").setRequired(true).addChoices({ name: "On", value: "true" }, { name: "Off", value: "false" })))
+        .addSubcommand(sc => sc.setName("commandperm").setDescription("Change the permission tier required to use a command")
+            .addStringOption(o => o.setName("command").setDescription("Command name, no slash (e.g. announce)").setRequired(true))
+            .addStringOption(o => o.setName("level").setDescription("Minimum tier required").setRequired(true)
+                .addChoices({ name: "Member", value: "member" }, { name: "Mod", value: "mod" }, { name: "Admin", value: "admin" }, { name: "Owner", value: "owner" })))
+        .addSubcommand(sc => sc.setName("resetcommandperm").setDescription("Remove a command permission override (revert to default)")
+            .addStringOption(o => o.setName("command").setDescription("Command name, no slash").setRequired(true))),
     new SlashCommandBuilder()
-        .setName("setgoodbyemsg").setDescription("[Admin] Set the goodbye message")
-        .addStringOption(o => o.setName("message").setDescription("Use {username} {server} {count}").setRequired(true)),
+        .setName("ticketpanel").setDescription("[Admin] Post a button panel members can click to open a ticket")
+        .addChannelOption(o => o.setName("channel").setDescription("Channel to post the panel in").setRequired(true).addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement))
+        .addStringOption(o => o.setName("title").setDescription("Panel title (optional)"))
+        .addStringOption(o => o.setName("description").setDescription("Panel description (optional)")),
     new SlashCommandBuilder()
-        .setName("setmodrole").setDescription("[Admin] Set the moderator role")
-        .addRoleOption(o => o.setName("role").setDescription("Moderator role").setRequired(true)),
-    new SlashCommandBuilder()
-        .setName("setautorole").setDescription("[Admin] Auto-assign role on join")
-        .addRoleOption(o => o.setName("role").setDescription("Role to auto-assign").setRequired(true)),
-    new SlashCommandBuilder()
-        .setName("setwelcomechannel").setDescription("[Admin] Set the welcome channel")
-        .addChannelOption(o => o.setName("channel").setDescription("Welcome channel").setRequired(true)),
-    new SlashCommandBuilder()
-        .setName("setgoodbyechannel").setDescription("[Admin] Set the goodbye/leave channel")
-        .addChannelOption(o => o.setName("channel").setDescription("Goodbye channel").setRequired(true)),
-    new SlashCommandBuilder()
-        .setName("setmodlogchannel").setDescription("[Admin] Set the mod-log channel")
-        .addChannelOption(o => o.setName("channel").setDescription("Mod-log channel").setRequired(true)),
-    new SlashCommandBuilder()
-        .setName("setticketcategory").setDescription("[Admin] Set category for ticket channels")
-        .addChannelOption(o => o.setName("category").setDescription("Category channel").setRequired(true)),
+        .setName("roblox").setDescription("Roblox / Roblox Studio version tracker")
+        .addSubcommand(sc => sc.setName("setchannel").setDescription("[Admin] Set the channel for new-version announcements")
+            .addChannelOption(o => o.setName("channel").setDescription("Updates channel").setRequired(true).addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)))
+        .addSubcommand(sc => sc.setName("status").setDescription("Show the tracked Roblox Client/Studio versions"))
+        .addSubcommand(sc => sc.setName("checknow").setDescription("[Admin] Force a version check right now")),
     new SlashCommandBuilder()
         .setName("enableai").setDescription("[Admin] Enable AI chat in this channel"),
     new SlashCommandBuilder()
@@ -641,9 +705,17 @@ const slashCommands = [
         .addStringOption(o => o.setName("image").setDescription("Cover image URL")),
     new SlashCommandBuilder()
         .setName("removegame").setDescription("[Admin] Remove a game from the website catalog")
-        .addStringOption(o => o.setName("title").setDescription("Exact game title").setRequired(true)),
+        .addStringOption(o => o.setName("title").setDescription("Exact game title").setRequired(true).setAutocomplete(true)),
     new SlashCommandBuilder()
         .setName("listgames").setDescription("[Admin] List all games in the website catalog"),
+    new SlashCommandBuilder()
+        .setName("sharegame").setDescription("Share a game from the catalog with everyone in this channel")
+        .addStringOption(o => o.setName("title").setDescription("Game title").setRequired(true).setAutocomplete(true)),
+    new SlashCommandBuilder()
+        .setName("games").setDescription("Browse the game catalog"),
+
+    // AI
+    new SlashCommandBuilder().setName("aiforget").setDescription("Clear your AI chat memory in this channel"),
 
     // OWNER
     new SlashCommandBuilder().setName("scanandclean").setDescription("[Owner] Scan + clean last 100 messages"),
@@ -671,8 +743,8 @@ async function registerSlashCommands() {
 
 // ====================== READY ======================
 client.once("clientReady", async () => {
-    console.log(`✅ Yobest_BYTR Bot v4.8 Online — ${client.user.tag}`);
-    client.user.setActivity("🛡️ Protecting the server | v4.8", { type: 3 });
+    console.log(`✅ Yobest_BYTR Bot v5.0 Online — ${client.user.tag}`);
+    client.user.setActivity("🛡️ Protecting the server | v5.0", { type: 3 });
 
     // ── Neon: init schema + hydrate all in-memory state ───────────────────────
     await db.initSchema();
@@ -689,6 +761,10 @@ client.once("clientReady", async () => {
             ticketCategoryId: row.ticket_category  || null,
             welcomeMessage:   row.welcome_message  || welcomeMessage,
             goodbyeMessage:   row.goodbye_message  || goodbyeMessage,
+            ticketLogChannelId:     row.ticket_log_channel   || null,
+            ticketPanelChannelId:   row.ticket_panel_channel || null,
+            ticketNamePrefix:       row.ticket_name_prefix   || "ticket",
+            robloxUpdatesChannelId: row.roblox_updates_channel || null,
         };
         guildSettings.set(row.guild_id, wrapSettings(row.guild_id, obj));
     }
@@ -719,8 +795,25 @@ client.once("clientReady", async () => {
     // config cache
     for (const [k, v] of Object.entries(state.config || {}))
         configCache[k] = v;
+    // additional mod roles
+    for (const row of (state.modRoles || [])) {
+        const set = extraModRoles.get(row.guild_id) || new Set();
+        set.add(row.role_id);
+        extraModRoles.set(row.guild_id, set);
+    }
+    // per-command permission overrides
+    for (const row of (state.commandPerms || [])) {
+        const map = commandPerms.get(row.guild_id) || new Map();
+        map.set(row.command, row.min_level);
+        commandPerms.set(row.guild_id, map);
+    }
 
     console.log(`✅ Hydrated from Neon: ${(state.xp||[]).length} XP, ${(state.warnings||[]).length} warnings, ${(state.openTickets||[]).length} tickets`);
+
+    // ── Roblox version tracker: baseline now, then poll on an interval ────────
+    checkRobloxUpdates().then(announceRobloxUpdates).catch((e) => console.warn("[roblox] startup check failed:", e.message));
+    setInterval(() => checkRobloxUpdates().then(announceRobloxUpdates).catch((e) => console.warn("[roblox] poll failed:", e.message)), ROBLOX_POLL_INTERVAL_MS);
+
 
     // ── Guild stat snapshots: immediate + every 5 min ─────────────────────────
     const snapshotAll = () => {
@@ -800,9 +893,9 @@ async function runStartupSelfTest() {
         }
         if (!ch) return;
         const embed = new EmbedBuilder()
-            .setTitle("✅ Yobest Bot v4.8 — Online")
+            .setTitle("✅ Yobest Bot v5.0 — Online")
             .setColor(0x00FFAA)
-            .setDescription("v4.8 — Neon DB persistence, website control panel, heartbeat, game catalog, config sync.")
+            .setDescription("v5.0 — Settings console, ticket panels + logging, granular permissions, Roblox version tracker, smarter AI memory, game catalog browser.")
             .addFields(
                 { name: "🛡️ Auto-Mod",        value: "✅ Instant regex + AI vision", inline: false },
                 { name: "🤬 Profanity",        value: `✅ ${PROFANITY_PATTERNS.length} patterns`, inline: true },
@@ -812,9 +905,11 @@ async function runStartupSelfTest() {
                 { name: "🤖 AI Agent",         value: "✅ /agent — full ACL + role permissions", inline: true },
                 { name: "👑 Owner Control",    value: "✅ /command — plain language, confirm-gated", inline: true },
                 { name: "📜 Script Announcer", value: "✅ /announcescript — file upload supported", inline: false },
+                { name: "🎫 Ticket Panels",    value: "✅ /ticketpanel — button + log channel", inline: true },
+                { name: "🧩 Roblox Tracker",   value: `✅ polling every ${Math.round(ROBLOX_POLL_INTERVAL_MS/60000)}m`, inline: true },
                 { name: "🧠 AI Model",         value: OPENROUTER_MODEL, inline: false },
             )
-            .setFooter({ text: "Yobest_BYTR Bot v4.8" })
+            .setFooter({ text: "Yobest_BYTR Bot v5.0" })
             .setTimestamp();
         await ch.send({ embeds: [embed] });
     } catch (e) { console.error("Startup self-test error:", e); }
@@ -913,7 +1008,9 @@ client.on("messageReactionRemove", async (reaction, user) => {
 //  SLASH COMMAND HANDLER
 // ═══════════════════════════════════════════════════════════════
 client.on("interactionCreate", async (interaction) => {
-    if (interaction.isButton()) { await handleButtonInteraction(interaction); return; }
+    if (interaction.isButton())          { await handleButtonInteraction(interaction); return; }
+    if (interaction.isAutocomplete())    { await handleAutocomplete(interaction); return; }
+    if (interaction.isStringSelectMenu()){ await handleSelectMenuInteraction(interaction); return; }
     if (!interaction.isChatInputCommand()) return;
 
     const { commandName, member, guild } = interaction;
@@ -1042,11 +1139,13 @@ client.on("interactionCreate", async (interaction) => {
             if (!d) return reply("🎯 Nothing to snipe recently.");
             return reply({ embeds: [new EmbedBuilder().setTitle("🎯 Sniped Message").setColor(0xFF8800).setDescription(d.content.slice(0, 2000)).setAuthor({ name: d.author, iconURL: d.avatarURL || undefined }).setTimestamp(d.timestamp)] });
         }
-        if (commandName === "help") return reply({ embeds: [buildHelpEmbed(permLevel)] });
+        if (commandName === "help") {
+            return reply({ embeds: [buildHelpCategoryEmbed("public", permLevel)], components: [buildHelpSelectRow(permLevel, "public")] }, true);
+        }
 
         // ---- AI SERVER BUILDER ----
         if (commandName === "generate") {
-            if (!requireLevel("admin", permLevel)) return replyErr("You need Admin or higher.");
+            if (!checkPerm(commandName, "admin", permLevel, guild.id)) return replyErr("You need Admin or higher.");
             if (!openaiClient) return replyErr("AI is not configured. Set `OPENROUTER_API_KEY`.");
             await interaction.deferReply();
             const prompt = interaction.options.getString("prompt");
@@ -1066,7 +1165,7 @@ client.on("interactionCreate", async (interaction) => {
 
         // ---- AI SERVER AGENT ----
         if (commandName === "agent") {
-            if (!requireLevel("admin", permLevel)) return replyErr("You need Admin or higher.");
+            if (!checkPerm(commandName, "admin", permLevel, guild.id)) return replyErr("You need Admin or higher.");
             if (!openaiClient) return replyErr("AI is not configured. Set `OPENROUTER_API_KEY`.");
             await interaction.deferReply();
             const instruction = interaction.options.getString("instruction");
@@ -1107,7 +1206,7 @@ client.on("interactionCreate", async (interaction) => {
         }
 
         if (commandName === "agentclear") {
-            if (!requireLevel("admin", permLevel)) return replyErr("You need Admin or higher.");
+            if (!checkPerm(commandName, "admin", permLevel, guild.id)) return replyErr("You need Admin or higher.");
             agentSessions.delete(`${guild.id}:${member.id}`);
             return reply("✅ Agent session cleared.", true);
         }
@@ -1147,7 +1246,7 @@ client.on("interactionCreate", async (interaction) => {
 
         // ---- SCRIPT ANNOUNCER ----
         if (commandName === "announcescript") {
-            if (!requireLevel("admin", permLevel)) return replyErr("You need Admin or higher.");
+            if (!checkPerm(commandName, "admin", permLevel, guild.id)) return replyErr("You need Admin or higher.");
             await interaction.deferReply({ ephemeral: true });
             const title     = interaction.options.getString("title");
             const desc      = interaction.options.getString("desc");
@@ -1182,7 +1281,7 @@ client.on("interactionCreate", async (interaction) => {
 
         // ---- MOD+ ----
         if (commandName === "warn") {
-            if (!requireLevel("mod", permLevel)) return replyErr("You need Mod or higher.");
+            if (!checkPerm(commandName, "mod", permLevel, guild.id)) return replyErr("You need Mod or higher.");
             const target = interaction.options.getMember("user");
             const reason = interaction.options.getString("reason");
             if (!target) return replyErr("User not found.");
@@ -1191,7 +1290,7 @@ client.on("interactionCreate", async (interaction) => {
             return reply(`⚠️ ${target} warned (${warns.length} total). Reason: **${reason}**`);
         }
         if (commandName === "warnings") {
-            if (!requireLevel("mod", permLevel)) return replyErr("You need Mod or higher.");
+            if (!checkPerm(commandName, "mod", permLevel, guild.id)) return replyErr("You need Mod or higher.");
             const target = interaction.options.getMember("user");
             if (!target) return replyErr("User not found.");
             const warns = warnHistory.get(target.id) || [];
@@ -1199,7 +1298,7 @@ client.on("interactionCreate", async (interaction) => {
             return reply({ embeds: [buildWarningsEmbed(target.user, warns)] });
         }
         if (commandName === "clearwarnings") {
-            if (!requireLevel("mod", permLevel)) return replyErr("You need Mod or higher.");
+            if (!checkPerm(commandName, "mod", permLevel, guild.id)) return replyErr("You need Mod or higher.");
             const target = interaction.options.getMember("user");
             if (!target) return replyErr("User not found.");
             warnHistory.delete(target.id);
@@ -1207,7 +1306,7 @@ client.on("interactionCreate", async (interaction) => {
             return reply(`✅ Cleared warnings for ${target}.`);
         }
         if (commandName === "mute") {
-            if (!requireLevel("mod", permLevel)) return replyErr("You need Mod or higher.");
+            if (!checkPerm(commandName, "mod", permLevel, guild.id)) return replyErr("You need Mod or higher.");
             const target = interaction.options.getMember("user");
             const reason = interaction.options.getString("reason") || "Muted by mod";
             if (!target) return replyErr("User not found.");
@@ -1215,47 +1314,44 @@ client.on("interactionCreate", async (interaction) => {
             return reply(`🔇 ${target} muted. Reason: **${reason}**`);
         }
         if (commandName === "unmute") {
-            if (!requireLevel("mod", permLevel)) return replyErr("You need Mod or higher.");
+            if (!checkPerm(commandName, "mod", permLevel, guild.id)) return replyErr("You need Mod or higher.");
             const target = interaction.options.getMember("user");
             if (!target) return replyErr("User not found.");
             await target.timeout(null);
             return reply(`🔊 ${target} unmuted.`);
         }
         if (commandName === "purge") {
-            if (!requireLevel("mod", permLevel)) return replyErr("You need Mod or higher.");
+            if (!checkPerm(commandName, "mod", permLevel, guild.id)) return replyErr("You need Mod or higher.");
             await interaction.deferReply({ ephemeral: true });
             const n       = interaction.options.getInteger("count");
             const deleted = await interaction.channel.bulkDelete(n, true);
             return reply(`🗑️ Deleted **${deleted.size}** messages.`);
         }
         if (commandName === "slowmode") {
-            if (!requireLevel("mod", permLevel)) return replyErr("You need Mod or higher.");
+            if (!checkPerm(commandName, "mod", permLevel, guild.id)) return replyErr("You need Mod or higher.");
             const secs = interaction.options.getInteger("seconds");
             await interaction.channel.setRateLimitPerUser(secs);
             return reply(secs === 0 ? "✅ Slowmode off." : `✅ Slowmode set to **${secs}s**.`);
         }
         if (commandName === "lock") {
-            if (!requireLevel("mod", permLevel)) return replyErr("You need Mod or higher.");
+            if (!checkPerm(commandName, "mod", permLevel, guild.id)) return replyErr("You need Mod or higher.");
             await interaction.channel.permissionOverwrites.edit(guild.roles.everyone, { SendMessages: false });
             return reply("🔒 Channel locked.");
         }
         if (commandName === "unlock") {
-            if (!requireLevel("mod", permLevel)) return replyErr("You need Mod or higher.");
+            if (!checkPerm(commandName, "mod", permLevel, guild.id)) return replyErr("You need Mod or higher.");
             await interaction.channel.permissionOverwrites.edit(guild.roles.everyone, { SendMessages: null });
             return reply("🔓 Channel unlocked.");
         }
         if (commandName === "closeticket") {
-            if (!requireLevel("mod", permLevel)) return replyErr("You need Mod or higher.");
+            if (!checkPerm(commandName, "mod", permLevel, guild.id)) return replyErr("You need Mod or higher.");
             if (!ticketChannels.has(interaction.channelId)) return replyErr("Not a ticket channel.");
             await reply("✅ Closing ticket...");
-            await interaction.channel.send("🎫 Ticket closed.").catch(() => {});
-            setTimeout(() => interaction.channel.delete().catch(() => {}), 3000);
-            ticketChannels.delete(interaction.channelId);
-            db.closeTicket(interaction.channelId).catch(() => {});
+            await closeTicketChannel(interaction.channel, member.user.tag);
             return;
         }
         if (commandName === "setnickname") {
-            if (!requireLevel("mod", permLevel)) return replyErr("You need Mod or higher.");
+            if (!checkPerm(commandName, "mod", permLevel, guild.id)) return replyErr("You need Mod or higher.");
             const target   = interaction.options.getMember("user");
             const nickname = interaction.options.getString("nickname") || null;
             if (!target) return replyErr("User not found.");
@@ -1265,7 +1361,7 @@ client.on("interactionCreate", async (interaction) => {
 
         // ---- ADMIN+ ----
         if (commandName === "ban") {
-            if (!requireLevel("admin", permLevel)) return replyErr("You need Admin or higher.");
+            if (!checkPerm(commandName, "admin", permLevel, guild.id)) return replyErr("You need Admin or higher.");
             const target = interaction.options.getMember("user");
             const reason = interaction.options.getString("reason") || "No reason provided";
             if (!target) return replyErr("User not found.");
@@ -1274,7 +1370,7 @@ client.on("interactionCreate", async (interaction) => {
             return reply({ embeds: [buildActionEmbed("🔨 Member Banned", 0xFF4444, target.user, member.user, reason)] });
         }
         if (commandName === "kick") {
-            if (!requireLevel("admin", permLevel)) return replyErr("You need Admin or higher.");
+            if (!checkPerm(commandName, "admin", permLevel, guild.id)) return replyErr("You need Admin or higher.");
             const target = interaction.options.getMember("user");
             const reason = interaction.options.getString("reason") || "No reason provided";
             if (!target) return replyErr("User not found.");
@@ -1283,7 +1379,7 @@ client.on("interactionCreate", async (interaction) => {
             return reply({ embeds: [buildActionEmbed("👢 Member Kicked", 0xFF8800, target.user, member.user, reason)] });
         }
         if (commandName === "announce") {
-            if (!requireLevel("admin", permLevel)) return replyErr("You need Admin or higher.");
+            if (!checkPerm(commandName, "admin", permLevel, guild.id)) return replyErr("You need Admin or higher.");
             await interaction.deferReply({ ephemeral: true });
             const title       = interaction.options.getString("title");
             const description = interaction.options.getString("desc");
@@ -1294,7 +1390,7 @@ client.on("interactionCreate", async (interaction) => {
             return reply("✅ Announcement posted!");
         }
         if (commandName === "giveaway") {
-            if (!requireLevel("admin", permLevel)) return replyErr("You need Admin or higher.");
+            if (!checkPerm(commandName, "admin", permLevel, guild.id)) return replyErr("You need Admin or higher.");
             const timeStr = interaction.options.getString("time");
             const prize   = interaction.options.getString("prize");
             const res     = parseTime(timeStr);
@@ -1302,52 +1398,105 @@ client.on("interactionCreate", async (interaction) => {
             await runGiveaway(interaction.channel, res.ms, prize, member.user.tag);
             return reply(`✅ Giveaway started! Drawing in **${timeStr}**.`);
         }
-        if (commandName === "setwelcome") {
-            if (!requireLevel("admin", permLevel)) return replyErr("You need Admin or higher.");
-            getSettings(guild.id).welcomeMessage = interaction.options.getString("message");
-            return reply("✅ Welcome message updated!");
+        if (commandName === "settings") {
+            if (!checkPerm("settings", "admin", permLevel, guild.id)) return replyErr("You need Admin or higher.");
+            const sub = interaction.options.getSubcommand();
+            const s   = getSettings(guild.id);
+            if (sub === "view") return reply({ embeds: [buildSettingsEmbed(guild)] });
+            if (sub === "welcomemessage") { s.welcomeMessage = interaction.options.getString("message"); return reply("✅ Welcome message updated!"); }
+            if (sub === "goodbyemessage") { s.goodbyeMessage = interaction.options.getString("message"); return reply("✅ Goodbye message updated!"); }
+            if (sub === "welcomechannel") { const c = interaction.options.getChannel("channel"); s.welcomeChannelId = c.id; return reply(`✅ Welcome channel set to ${c}.`); }
+            if (sub === "goodbyechannel") { const c = interaction.options.getChannel("channel"); s.goodbyeChannelId = c.id; return reply(`✅ Goodbye channel set to ${c}.`); }
+            if (sub === "modlogchannel")  { const c = interaction.options.getChannel("channel"); s.modlogChannelId = c.id; return reply(`✅ Mod-log channel set to ${c}.`); }
+            if (sub === "autorole")       { const r = interaction.options.getRole("role"); s.autoRoleId = r.id; return reply(`✅ Auto-role set to **${r.name}**.`); }
+            if (sub === "modrole")        { const r = interaction.options.getRole("role"); s.modRoleId = r.id; return reply(`✅ Primary mod role set to **${r.name}**.`); }
+            if (sub === "addmodrole") {
+                const r = interaction.options.getRole("role");
+                const set = extraModRoles.get(guild.id) || new Set();
+                set.add(r.id); extraModRoles.set(guild.id, set);
+                db.addModRole(guild.id, r.id).catch(() => {});
+                return reply(`✅ **${r.name}** can now use Mod commands.`);
+            }
+            if (sub === "removemodrole") {
+                const r = interaction.options.getRole("role");
+                extraModRoles.get(guild.id)?.delete(r.id);
+                db.removeModRole(guild.id, r.id).catch(() => {});
+                return reply(`✅ **${r.name}** no longer has the extra Mod permission.`);
+            }
+            if (sub === "ticketcategory") {
+                const cat = interaction.options.getChannel("category");
+                if (cat.type !== ChannelType.GuildCategory) return replyErr("Must be a **Category** channel.");
+                s.ticketCategoryId = cat.id;
+                return reply(`✅ Ticket category set to **${cat.name}**.`);
+            }
+            if (sub === "ticketlogchannel") { const c = interaction.options.getChannel("channel"); s.ticketLogChannelId = c.id; return reply(`✅ Ticket log channel set to ${c}.`); }
+            if (sub === "ticketnameprefix") {
+                const prefix = sanitizeChannelName(interaction.options.getString("prefix")) || "ticket";
+                s.ticketNamePrefix = prefix;
+                return reply(`✅ New tickets will be named like \`#${prefix}-username\`.`);
+            }
+            if (sub === "robloxchannel") { const c = interaction.options.getChannel("channel"); s.robloxUpdatesChannelId = c.id; return reply(`✅ Roblox version updates will post in ${c}.`); }
+            if (sub === "toggle") {
+                const feature = interaction.options.getString("feature");
+                const value   = interaction.options.getString("value");
+                configCache[feature] = value;
+                db.setConfig(feature, value, member.user.tag).catch(() => {});
+                return reply(`✅ **${feature}** is now **${value === "true" ? "ON" : "OFF"}**.`);
+            }
+            if (sub === "commandperm") {
+                const cmdArg = interaction.options.getString("command").toLowerCase().replace(/^\//, "");
+                const level  = interaction.options.getString("level");
+                if (!slashCommands.some(c => c.name === cmdArg)) return replyErr(`Unknown command: \`${cmdArg}\``);
+                const map = commandPerms.get(guild.id) || new Map();
+                map.set(cmdArg, level); commandPerms.set(guild.id, map);
+                db.setCommandPermission(guild.id, cmdArg, level).catch(() => {});
+                return reply(`✅ \`/${cmdArg}\` now requires **${level}** or higher.`);
+            }
+            if (sub === "resetcommandperm") {
+                const cmdArg = interaction.options.getString("command").toLowerCase().replace(/^\//, "");
+                commandPerms.get(guild.id)?.delete(cmdArg);
+                db.removeCommandPermission(guild.id, cmdArg).catch(() => {});
+                return reply(`✅ \`/${cmdArg}\` reverted to its default permission tier.`);
+            }
+            return replyErr("Unknown settings subcommand.");
         }
-        if (commandName === "setgoodbyemsg") {
-            if (!requireLevel("admin", permLevel)) return replyErr("You need Admin or higher.");
-            getSettings(guild.id).goodbyeMessage = interaction.options.getString("message");
-            return reply("✅ Goodbye message updated!");
+        if (commandName === "ticketpanel") {
+            if (!checkPerm("ticketpanel", "admin", permLevel, guild.id)) return replyErr("You need Admin or higher.");
+            const channel = interaction.options.getChannel("channel");
+            const title   = interaction.options.getString("title") || "🎫 Need Help?";
+            const desc    = interaction.options.getString("description") || "Click the button below to open a private support ticket. A staff member will be with you shortly.";
+            const embed   = new EmbedBuilder().setTitle(title).setColor(0x00FFAA).setDescription(desc).setFooter({ text: SITE_INFO.name }).setTimestamp();
+            const row     = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId("ticket_open_btn").setLabel("🎫 Open Ticket").setStyle(ButtonStyle.Success));
+            await channel.send({ embeds: [embed], components: [row] });
+            getSettings(guild.id).ticketPanelChannelId = channel.id;
+            return reply(`✅ Ticket panel posted in ${channel}.`);
         }
-        if (commandName === "setmodrole") {
-            if (!requireLevel("admin", permLevel)) return replyErr("You need Admin or higher.");
-            getSettings(guild.id).modRoleId = interaction.options.getRole("role").id;
-            return reply(`✅ Mod role set to **${interaction.options.getRole("role").name}**.`);
+        if (commandName === "roblox") {
+            const sub = interaction.options.getSubcommand();
+            if (sub === "status") {
+                if (!checkPerm("roblox", "mod", permLevel, guild.id)) return replyErr("You need Mod or higher.");
+                return reply({ embeds: [await getRobloxStatusEmbed(guild)] });
+            }
+            if (!checkPerm("roblox", "admin", permLevel, guild.id)) return replyErr("You need Admin or higher.");
+            if (sub === "setchannel") {
+                const c = interaction.options.getChannel("channel");
+                getSettings(guild.id).robloxUpdatesChannelId = c.id;
+                return reply(`✅ Roblox version updates will post in ${c}.`);
+            }
+            if (sub === "checknow") {
+                await interaction.deferReply();
+                const changed = await checkRobloxUpdates();
+                await announceRobloxUpdates(changed);
+                const kinds = Object.keys(changed);
+                if (!kinds.length) return reply("ℹ️ No new Roblox Client/Studio versions detected.");
+                return reply(`✅ Detected new version(s) for: **${kinds.join(", ")}**. ${getSettings(guild.id).robloxUpdatesChannelId ? "Announced!" : "Set a channel with `/roblox setchannel` to announce automatically."}`);
+            }
+            return replyErr("Unknown roblox subcommand.");
         }
-        if (commandName === "setautorole") {
-            if (!requireLevel("admin", permLevel)) return replyErr("You need Admin or higher.");
-            getSettings(guild.id).autoRoleId = interaction.options.getRole("role").id;
-            return reply(`✅ Auto-role set to **${interaction.options.getRole("role").name}**.`);
-        }
-        if (commandName === "setwelcomechannel") {
-            if (!requireLevel("admin", permLevel)) return replyErr("You need Admin or higher.");
-            getSettings(guild.id).welcomeChannelId = interaction.options.getChannel("channel").id;
-            return reply(`✅ Welcome channel set to ${interaction.options.getChannel("channel")}.`);
-        }
-        if (commandName === "setgoodbyechannel") {
-            if (!requireLevel("admin", permLevel)) return replyErr("You need Admin or higher.");
-            getSettings(guild.id).goodbyeChannelId = interaction.options.getChannel("channel").id;
-            return reply(`✅ Goodbye channel set to ${interaction.options.getChannel("channel")}.`);
-        }
-        if (commandName === "setmodlogchannel") {
-            if (!requireLevel("admin", permLevel)) return replyErr("You need Admin or higher.");
-            getSettings(guild.id).modlogChannelId = interaction.options.getChannel("channel").id;
-            return reply(`✅ Mod-log set to ${interaction.options.getChannel("channel")}.`);
-        }
-        if (commandName === "setticketcategory") {
-            if (!requireLevel("admin", permLevel)) return replyErr("You need Admin or higher.");
-            const cat = interaction.options.getChannel("category");
-            if (cat.type !== ChannelType.GuildCategory) return replyErr("Must be a **Category** channel.");
-            getSettings(guild.id).ticketCategoryId = cat.id;
-            return reply(`✅ Ticket category set to **${cat.name}**.`);
-        }
-        if (commandName === "enableai")  { if (!requireLevel("admin", permLevel)) return replyErr("You need Admin or higher."); aiEnabledChannels.add(interaction.channelId); return reply("✅ AI Chat enabled."); }
-        if (commandName === "disableai") { if (!requireLevel("admin", permLevel)) return replyErr("You need Admin or higher."); aiEnabledChannels.delete(interaction.channelId); return reply("❌ AI Chat disabled."); }
+        if (commandName === "enableai")  { if (!checkPerm(commandName, "admin", permLevel, guild.id)) return replyErr("You need Admin or higher."); aiEnabledChannels.add(interaction.channelId); return reply("✅ AI Chat enabled."); }
+        if (commandName === "disableai") { if (!checkPerm(commandName, "admin", permLevel, guild.id)) return replyErr("You need Admin or higher."); aiEnabledChannels.delete(interaction.channelId); return reply("❌ AI Chat disabled."); }
         if (commandName === "addcmd") {
-            if (!requireLevel("admin", permLevel)) return replyErr("You need Admin or higher.");
+            if (!checkPerm(commandName, "admin", permLevel, guild.id)) return replyErr("You need Admin or higher.");
             const trigger  = interaction.options.getString("trigger").toLowerCase().replace(/^!/, "");
             const response = interaction.options.getString("response");
             const map = customCmds.get(guild.id) || new Map();
@@ -1357,7 +1506,7 @@ client.on("interactionCreate", async (interaction) => {
             return reply(`✅ Custom command \`!${trigger}\` added.`);
         }
         if (commandName === "removecmd") {
-            if (!requireLevel("admin", permLevel)) return replyErr("You need Admin or higher.");
+            if (!checkPerm(commandName, "admin", permLevel, guild.id)) return replyErr("You need Admin or higher.");
             const trigger = interaction.options.getString("trigger").toLowerCase().replace(/^!/, "");
             const map = customCmds.get(guild.id);
             if (!map || !map.has(trigger)) return replyErr(`No command \`!${trigger}\` found.`);
@@ -1366,13 +1515,13 @@ client.on("interactionCreate", async (interaction) => {
             return reply(`✅ Removed \`!${trigger}\`.`);
         }
         if (commandName === "listcmds") {
-            if (!requireLevel("admin", permLevel)) return replyErr("You need Admin or higher.");
+            if (!checkPerm(commandName, "admin", permLevel, guild.id)) return replyErr("You need Admin or higher.");
             const map = customCmds.get(guild.id);
             if (!map || !map.size) return reply("No custom commands set.");
             return reply({ embeds: [new EmbedBuilder().setTitle("📋 Custom Commands").setColor(0x00FFAA).setDescription([...map.entries()].map(([k, v]) => `\`!${k}\` → ${v.slice(0, 50)}`).join("\n"))] });
         }
         if (commandName === "reactionrole") {
-            if (!requireLevel("admin", permLevel)) return replyErr("You need Admin or higher.");
+            if (!checkPerm(commandName, "admin", permLevel, guild.id)) return replyErr("You need Admin or higher.");
             const msgId = interaction.options.getString("messageid");
             const emoji = interaction.options.getString("emoji");
             const role  = interaction.options.getRole("role");
@@ -1382,7 +1531,7 @@ client.on("interactionCreate", async (interaction) => {
             return reply(`✅ Reaction role set! ${emoji} → **${role.name}**.`);
         }
         if (commandName === "clearxp") {
-            if (!requireLevel("admin", permLevel)) return replyErr("You need Admin or higher.");
+            if (!checkPerm(commandName, "admin", permLevel, guild.id)) return replyErr("You need Admin or higher.");
             const target = interaction.options.getMember("user");
             if (!target) return replyErr("User not found.");
             xpData.delete(target.id);
@@ -1392,7 +1541,7 @@ client.on("interactionCreate", async (interaction) => {
 
         // ---- GAME CATALOG ----
         if (commandName === "addgame") {
-            if (!requireLevel("admin", permLevel)) return replyErr("You need Admin or higher.");
+            if (!checkPerm(commandName, "admin", permLevel, guild.id)) return replyErr("You need Admin or higher.");
             if (!db.ready()) return replyErr("Database not configured — set `DATABASE_URL` to enable the game catalog.");
             const title = interaction.options.getString("title");
             const desc  = interaction.options.getString("description");
@@ -1402,19 +1551,45 @@ client.on("interactionCreate", async (interaction) => {
             return reply(`✅ **${title}** added to the website games page.`);
         }
         if (commandName === "removegame") {
-            if (!requireLevel("admin", permLevel)) return replyErr("You need Admin or higher.");
+            if (!checkPerm(commandName, "admin", permLevel, guild.id)) return replyErr("You need Admin or higher.");
             if (!db.ready()) return replyErr("Database not configured.");
             const title   = interaction.options.getString("title");
             const removed = await db.removeGame(title);
             return removed ? reply(`✅ **${title}** removed from the catalog.`) : replyErr(`No game found: **${title}**`);
         }
         if (commandName === "listgames") {
-            if (!requireLevel("admin", permLevel)) return replyErr("You need Admin or higher.");
+            if (!checkPerm(commandName, "admin", permLevel, guild.id)) return replyErr("You need Admin or higher.");
             if (!db.ready()) return replyErr("Database not configured.");
             const games = await db.listGames();
             if (!games.length) return reply("No games in the catalog yet. Use `/addgame` to add one.");
             const lines = games.map((g, i) => `**${i+1}.** ${g.title} *(${g.status})* ${g.play_url ? `— [Play](${g.play_url})` : ""}`);
             return reply({ embeds: [new EmbedBuilder().setTitle("🎮 Game Catalog").setColor(0x00FFAA).setDescription(lines.join("\n")).setFooter({ text: "Manage with /addgame and /removegame" })] });
+        }
+        if (commandName === "sharegame") {
+            if (!db.ready()) return replyErr("Database not configured — set `DATABASE_URL` to enable the game catalog.");
+            const title = interaction.options.getString("title");
+            const game  = await db.getGame(title);
+            if (!game || game.status !== "live") return replyErr(`No live game found matching **${title}**. Use \`/games\` to browse the catalog.`);
+            const row = buildGameButtonsRow(game);
+            return reply({
+                content:    `🎮 **${member.user.username}** shared a game!`,
+                embeds:     [buildGameEmbed(game, member.user)],
+                components: row ? [row] : [],
+            });
+        }
+        if (commandName === "games") {
+            if (!db.ready()) return replyErr("Database not configured — set `DATABASE_URL` to enable the game catalog.");
+            const games = (await db.listGames()).filter(g => g.status === "live");
+            if (!games.length) return reply("No games in the catalog yet.");
+            const game       = games[0];
+            const components = [buildGameSelectRow(games, game.title)];
+            const btnRow     = buildGameButtonsRow(game);
+            if (btnRow) components.push(btnRow);
+            return reply({ embeds: [buildGameEmbed(game)], components }, true);
+        }
+        if (commandName === "aiforget") {
+            aiChatHistory.delete(`${interaction.channelId}:${member.id}`);
+            return reply("🧹 Cleared your AI chat memory in this channel.", true);
         }
 
         // ---- OWNER ----
@@ -1442,7 +1617,7 @@ client.on("interactionCreate", async (interaction) => {
             return reply(`**Auto-mod test:**\n${results.join("\n")}`);
         }
         if (commandName === "aitest") {
-            if (guild.ownerId !== member.id && !requireLevel("admin", permLevel)) return replyErr("Admin or higher.");
+            if (guild.ownerId !== member.id && !checkPerm(commandName, "admin", permLevel, guild.id)) return replyErr("Admin or higher.");
             await interaction.deferReply();
             try {
                 const result = await callAI("Reply with exactly: AI is working fine!", "Reply with exactly: AI is working fine!", 20);
@@ -1566,6 +1741,19 @@ async function handleButtonInteraction(interaction) {
         });
     }
 
+    if (id === "ticket_open_btn") {
+        const existing = [...interaction.guild.channels.cache.values()].find(
+            c => ticketChannels.has(c.id) && c.topic?.includes(`(${interaction.user.id})`)
+        );
+        if (existing) return interaction.reply({ content: `❌ You already have an open ticket: ${existing}`, ephemeral: true });
+        try {
+            const ch = await createTicketChannel(interaction.guild, interaction.member);
+            return interaction.reply({ content: `✅ Ticket created: ${ch}`, ephemeral: true });
+        } catch (e) {
+            return interaction.reply({ content: `❌ Could not create ticket: ${e.message}`, ephemeral: true });
+        }
+    }
+
     if (id === "ticket_close_btn") {
         const permLevel = getPermLevel(interaction.member, interaction.guild);
         if (!requireLevel("mod", permLevel)) {
@@ -1575,10 +1763,85 @@ async function handleButtonInteraction(interaction) {
             return interaction.reply({ content: "❌ Not a ticket channel.", ephemeral: true });
         }
         await interaction.reply("🔒 Closing ticket in 3 seconds...");
-        ticketChannels.delete(interaction.channelId);
-        db.closeTicket(interaction.channelId).catch(() => {});
-        setTimeout(() => interaction.channel.delete().catch(() => {}), 3000);
+        await closeTicketChannel(interaction.channel, interaction.user.tag);
         return;
+    }
+}
+
+// Closes a ticket channel: logs a summary to the ticket log channel (if
+// configured), persists the closure, then deletes the channel after a delay.
+async function closeTicketChannel(channel, closedByTag) {
+    const guild = channel.guild;
+    const s     = getSettings(guild.id);
+    ticketChannels.delete(channel.id);
+    db.closeTicket(channel.id).catch(() => {});
+
+    if (s.ticketLogChannelId) {
+        const logCh = guild.channels.cache.get(s.ticketLogChannelId);
+        if (logCh?.send) {
+            const openedByMatch = channel.topic?.match(/for (.+) \(/);
+            const embed = new EmbedBuilder()
+                .setTitle("🎫 Ticket Closed")
+                .setColor(0xFF8800)
+                .addFields(
+                    { name: "Channel",  value: `#${channel.name}`, inline: true },
+                    { name: "Opened By", value: openedByMatch?.[1] || "Unknown", inline: true },
+                    { name: "Closed By", value: closedByTag || "Unknown", inline: true },
+                )
+                .setTimestamp();
+            await logCh.send({ embeds: [embed] }).catch(() => {});
+        }
+    }
+    await channel.send("🎫 Ticket closed.").catch(() => {});
+    setTimeout(() => channel.delete().catch(() => {}), 3000);
+}
+
+// ================================================================
+//  AUTOCOMPLETE HANDLER (game titles)
+// ================================================================
+async function handleAutocomplete(interaction) {
+    try {
+        if (!["sharegame", "removegame"].includes(interaction.commandName)) return interaction.respond([]);
+        if (!db.ready()) return interaction.respond([]);
+        const focused = (interaction.options.getFocused() || "").toLowerCase();
+        const games   = await db.listGames();
+        const matches = games
+            .filter(g => g.title.toLowerCase().includes(focused))
+            .slice(0, 25)
+            .map(g => ({ name: g.title.slice(0, 100), value: g.title.slice(0, 100) }));
+        return interaction.respond(matches);
+    } catch (e) {
+        console.warn("[autocomplete]", e.message);
+        try { await interaction.respond([]); } catch {}
+    }
+}
+
+// ================================================================
+//  SELECT MENU HANDLER (help category browser, game catalog browser)
+// ================================================================
+async function handleSelectMenuInteraction(interaction) {
+    try {
+        if (interaction.customId === "help_category_select") {
+            const permLevel = getPermLevel(interaction.member, interaction.guild);
+            const categoryId = interaction.values[0];
+            return interaction.update({
+                embeds:     [buildHelpCategoryEmbed(categoryId, permLevel)],
+                components: [buildHelpSelectRow(permLevel, categoryId)],
+            });
+        }
+        if (interaction.customId === "games_browse_select") {
+            const title = interaction.values[0];
+            const game  = await db.getGame(title);
+            if (!game) return interaction.update({ content: "❌ That game is no longer available.", embeds: [], components: [] });
+            const games       = (await db.listGames()).filter(g => g.status === "live");
+            const components  = [buildGameSelectRow(games, title)];
+            const btnRow      = buildGameButtonsRow(game);
+            if (btnRow) components.push(btnRow);
+            return interaction.update({ embeds: [buildGameEmbed(game)], components });
+        }
+    } catch (e) {
+        console.error("[selectmenu]", e.message);
+        try { await interaction.reply({ content: `❌ Error: ${e.message}`, ephemeral: true }); } catch {}
     }
 }
 
@@ -2287,7 +2550,7 @@ client.on("messageCreate", async (message) => {
         if (lower.startsWith("!slowmode ")) { const s = parseInt(content.split(" ")[1]); if (isNaN(s) || s < 0 || s > 21600) return message.reply("❌ 0-21600"); await message.channel.setRateLimitPerUser(s); return message.reply(s === 0 ? "✅ Slowmode off." : `✅ Slowmode: ${s}s.`); }
         if (lower === "!lock")         { await message.channel.permissionOverwrites.edit(message.guild.roles.everyone, { SendMessages: false }); return message.reply("🔒 Locked."); }
         if (lower === "!unlock")       { await message.channel.permissionOverwrites.edit(message.guild.roles.everyone, { SendMessages: null });  return message.reply("🔓 Unlocked."); }
-        if (lower === "!closeticket")  { if (!ticketChannels.has(message.channelId)) return message.reply("❌ Not a ticket channel."); await message.reply("✅ Closing..."); setTimeout(() => message.channel.delete().catch(() => {}), 3000); ticketChannels.delete(message.channelId); db.closeTicket(message.channelId).catch(() => {}); return; }
+        if (lower === "!closeticket")  { if (!ticketChannels.has(message.channelId)) return message.reply("❌ Not a ticket channel."); await message.reply("✅ Closing..."); await closeTicketChannel(message.channel, message.author.tag); return; }
     }
 
     // PUBLIC PREFIX
@@ -2302,6 +2565,7 @@ client.on("messageCreate", async (message) => {
     if (lower === "!rank")        { const d = xpData.get(message.author.id) || { xp: 0, level: 0 }; const n = XP_FOR_LEVEL(d.level + 1); return message.reply({ embeds: [new EmbedBuilder().setColor(0x00FFAA).setTitle(`⭐ ${message.author.tag}'s Rank`).setThumbnail(message.author.displayAvatarURL({ dynamic: true })).addFields({ name: "Level", value: `**${d.level}**`, inline: true }, { name: "XP", value: `**${d.xp}/${n}**`, inline: true }).setDescription(buildXPBar(d.xp, n)).setTimestamp()] }); }
     if (lower === "!leaderboard") return message.reply({ embeds: [buildLeaderboard(message.guild)] });
     if (lower === "!ticket")      return await handleTicketPrefix(message);
+    if (lower === "!aiforget")    { aiChatHistory.delete(`${message.channelId}:${message.author.id}`); return message.reply("🧹 Cleared your AI chat memory in this channel."); }
     if (lower === "!site")        return message.reply({ embeds: [buildSiteEmbed()], components: [buildSiteRow()] });
     if (lower === "!discord")     return message.reply("🔗 **Join:** https://discord.gg/yobest");
     if (lower === "!userinfo" || lower.startsWith("!userinfo "))   { const t = message.mentions.members?.first() || message.member; return message.reply({ embeds: [buildUserInfoEmbed(t, message.guild)] }); }
@@ -2364,10 +2628,14 @@ client.on("messageCreate", async (message) => {
     if (aiEnabledChannels.has(message.channel.id) && getCfg("ai_enabled","true") === "true") {
         const triggers = ["yobest","bot","script","code","site","website","hello","hi","help","roblox","lua"];
         if (message.mentions.has(client.user) || triggers.some(t => lower.includes(t))) {
-            const thinking = await message.reply("🤔 **Yobest is thinking...**");
-            const response = await getAIResponse(message);
-            await thinking.delete().catch(() => {});
-            if (response) await sendAIResponse(message, response);
+            await message.channel.sendTyping().catch(() => {});
+            const typingInterval = setInterval(() => message.channel.sendTyping().catch(() => {}), 8_000);
+            try {
+                const response = await getAIResponse(message);
+                if (response) await sendAIResponse(message, response);
+            } finally {
+                clearInterval(typingInterval);
+            }
         }
     }
 });
@@ -2560,23 +2828,67 @@ async function classifyImageWithAI(url) {
     } catch { return { flagged: false }; }
 }
 
+// Default persona used when no website override is set. Context + formatting
+// rules below are always appended, even on top of a custom override, so a
+// website-set persona never silently loses the Lua-formatting / concision rules.
+const DEFAULT_AI_SYSTEM_PROMPT =
+    `You are ${AI_DISPLAY_NAME}, a friendly Roblox Lua scripting expert and Discord bot for ${SITE_INFO.name}.\n` +
+    `About the site: ${SITE_INFO.description}`;
+
+function buildAISystemPrompt(guild) {
+    const persona = getCfg("ai_system_prompt") || DEFAULT_AI_SYSTEM_PROMPT;
+    return `${persona}\n\n` +
+        `Context:\n` +
+        `- Server: ${guild?.name || "a Discord server"}\n` +
+        `- Website: ${SITE_INFO.url}\n` +
+        `- Today's date: ${new Date().toUTCString()}\n\n` +
+        `Rules:\n` +
+        `- Respond in English, keep replies concise and friendly (Discord chat, not an essay).\n` +
+        `- For Lua/Roblox scripts, write the full code in a single \`\`\`lua block.\n` +
+        `- Use Discord markdown (bold, bullet points) instead of walls of plain text.\n` +
+        `- If you don't know something, say so rather than inventing facts.\n` +
+        `- Mention relevant slash commands when helpful (e.g. /ticket, /games, /sharegame, /site).\n` +
+        `- You have access to recent conversation turns below — use them for continuity, ` +
+        `but a user can run /aiforget to clear this memory at any time.`;
+}
+
+// Lightweight per-user, per-channel conversation memory. Resets automatically
+// after AI_HISTORY_IDLE_MS of inactivity, and is capped to the most recent
+// AI_HISTORY_MAX_TURNS exchanges so it can't grow unbounded.
+function getAIHistory(channelId, userId) {
+    const key   = `${channelId}:${userId}`;
+    const entry = aiChatHistory.get(key);
+    if (entry && Date.now() - entry.last < AI_HISTORY_IDLE_MS) return entry;
+    const fresh = { history: [], last: Date.now() };
+    aiChatHistory.set(key, fresh);
+    return fresh;
+}
+function pushAIHistory(channelId, userId, role, content) {
+    const entry = getAIHistory(channelId, userId);
+    entry.history.push({ role, content });
+    const maxEntries = AI_HISTORY_MAX_TURNS * 2; // user+assistant per turn
+    if (entry.history.length > maxEntries) entry.history.splice(0, entry.history.length - maxEntries);
+    entry.last = Date.now();
+}
+
 async function getAIResponse(message) {
     if (!openaiClient) return "⚠️ AI is not configured — set `OPENROUTER_API_KEY`.";
-    const userInput    = message.content.replace(/<@!?[0-9]+>/g, "").trim() || "Hello";
-    // Use system prompt from website control panel if set, otherwise use default
-    const systemPrompt = getCfg("ai_system_prompt") ||
-        `You are ${AI_DISPLAY_NAME}, a friendly Roblox Lua scripting expert and Discord bot for ${SITE_INFO.name}.\n` +
-        `About the site: ${SITE_INFO.description}\n\n` +
-        `Rules: Respond in English. For Lua/Roblox scripts write complete code in a \`\`\`lua block. ` +
-        `For site questions refer to ${SITE_INFO.url}. Keep replies concise and friendly.`;
+    const userInput     = message.content.replace(/<@!?[0-9]+>/g, "").trim() || "Hello";
+    const systemPrompt  = buildAISystemPrompt(message.guild);
     // Use model from website control panel if set, otherwise use default
     const activeModel = getCfg("ai_model") || OPENROUTER_MODEL;
     const models = [activeModel, OPENROUTER_FALLBACK].filter((v,i,a) => a.indexOf(v)===i);
+    const { history } = getAIHistory(message.channelId, message.author.id);
+    const messages = [{ role: "system", content: systemPrompt }, ...history, { role: "user", content: userInput }];
     for (const model of models) {
         try {
-            const c    = await openaiClient.chat.completions.create({ model, messages: [{ role: "system", content: systemPrompt }, { role: "user", content: userInput }], max_tokens: 600, temperature: 0.7 });
+            const c    = await openaiClient.chat.completions.create({ model, messages, max_tokens: 600, temperature: 0.7 });
             const text = c?.choices?.[0]?.message?.content;
-            if (text) return text;
+            if (text) {
+                pushAIHistory(message.channelId, message.author.id, "user", userInput);
+                pushAIHistory(message.channelId, message.author.id, "assistant", text);
+                return text;
+            }
         } catch (e) {
             const msg = e?.message || String(e);
             if (msg.includes("402") || msg.includes("credits")) return "⚠️ AI ran out of credits. Top up at https://openrouter.ai/settings/credits";
@@ -2590,8 +2902,84 @@ async function getAIResponse(message) {
 
 
 // ================================================================
+//  ROBLOX VERSION TRACKER
+// ================================================================
+// Polls Roblox's public client-version endpoints and announces new
+// Roblox Client / Roblox Studio releases to each guild's configured channel.
+async function fetchRobloxVersion(kind) {
+    try {
+        const res = await fetch(ROBLOX_VERSION_ENDPOINTS[kind], { signal: AbortSignal.timeout(10_000) });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return await res.json();
+    } catch (e) {
+        console.warn(`[roblox] ${kind} version fetch failed:`, e.message);
+        return null;
+    }
+}
+
+async function checkRobloxUpdates() {
+    const changed = {};
+    for (const kind of Object.keys(ROBLOX_VERSION_ENDPOINTS)) {
+        const data = await fetchRobloxVersion(kind);
+        if (!data?.version) continue;
+        const key  = `roblox_${kind}_version`;
+        const prev = await db.getConfig(key);
+        if (prev !== data.version) {
+            changed[kind] = { previous: prev, current: data.version, isFirstCheck: !prev };
+            await db.setConfig(key, data.version, "roblox-tracker");
+        }
+    }
+    return changed;
+}
+
+async function announceRobloxUpdates(changed) {
+    const kinds = Object.keys(changed || {});
+    if (!kinds.length) return;
+    for (const guild of client.guilds.cache.values()) {
+        const s  = getSettings(guild.id);
+        if (!s.robloxUpdatesChannelId) continue;
+        const ch = guild.channels.cache.get(s.robloxUpdatesChannelId);
+        if (!ch?.send) continue;
+        for (const kind of kinds) {
+            const info = changed[kind];
+            if (info.isFirstCheck) continue; // don't spam on the very first check ever
+            const label = kind === "client" ? "🎮 Roblox Client" : "🛠️ Roblox Studio";
+            const embed = new EmbedBuilder()
+                .setTitle(`${label} — New Version Released`)
+                .setColor(0x00A2FF)
+                .addFields(
+                    { name: "Previous Version", value: `\`${info.previous}\``, inline: true },
+                    { name: "New Version",      value: `\`${info.current}\``,  inline: true },
+                )
+                .setFooter({ text: "Roblox Version Tracker" })
+                .setTimestamp();
+            await ch.send({ embeds: [embed] }).catch(() => {});
+        }
+    }
+}
+
+async function getRobloxStatusEmbed(guild) {
+    const s = getSettings(guild.id);
+    const [clientVer, studioVer] = await Promise.all([
+        db.getConfig("roblox_client_version"),
+        db.getConfig("roblox_studio_version"),
+    ]);
+    return new EmbedBuilder()
+        .setTitle("🧩 Roblox Version Tracker")
+        .setColor(0x00A2FF)
+        .addFields(
+            { name: "Updates Channel", value: s.robloxUpdatesChannelId ? `<#${s.robloxUpdatesChannelId}>` : "*Not set — use `/roblox setchannel`*", inline: false },
+            { name: "🎮 Roblox Client", value: clientVer ? `\`${clientVer}\`` : "*Unknown yet*", inline: true },
+            { name: "🛠️ Roblox Studio", value: studioVer ? `\`${studioVer}\`` : "*Unknown yet*", inline: true },
+            { name: "Poll Interval", value: `Every ${Math.round(ROBLOX_POLL_INTERVAL_MS / 60000)} min`, inline: true },
+        )
+        .setTimestamp();
+}
+
+// ================================================================
 //  WARN ESCALATION + MOD-LOG
 // ================================================================
+
 async function logToModChannel(guild, embed) {
     try {
         const s  = getSettings(guild.id);
@@ -2902,9 +3290,11 @@ async function createTicketChannel(guild, requester) {
         { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ManageChannels] },
     ];
     if (s.modRoleId) overwrites.push({ id: s.modRoleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
+    for (const roleId of (extraModRoles.get(guild.id) || []))
+        overwrites.push({ id: roleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
 
     const ch = await guild.channels.create({
-        name: sanitizeChannelName(`ticket-${requester.user.username}`),
+        name: sanitizeChannelName(`${s.ticketNamePrefix || "ticket"}-${requester.user.username}`),
         type: ChannelType.GuildText,
         parent: s.ticketCategoryId || undefined,
         permissionOverwrites: overwrites,
@@ -2960,7 +3350,7 @@ function buildStatsEmbed(guild) {
             { name: "💾 Memory",      value: `${(mem.heapUsed / 1024 / 1024).toFixed(1)} MB`, inline: true },
             { name: "🌐 Servers",     value: `${client.guilds.cache.size}`, inline: true },
             { name: "👥 Members",     value: `${guild?.memberCount ?? "?"}`, inline: true },
-            { name: "📦 Version",     value: "v4.7", inline: true },
+            { name: "📦 Version",     value: "v5.0", inline: true },
         )
         .setFooter({ text: `${SITE_INFO.name}` })
         .setTimestamp();
@@ -2972,7 +3362,7 @@ function buildBotInfoEmbed() {
         .setColor(0x00FFAA)
         .setThumbnail(client.user.displayAvatarURL({ dynamic: true }))
         .addFields(
-            { name: "Version",     value: "v4.7", inline: true },
+            { name: "Version",     value: "v5.0", inline: true },
             { name: "Library",     value: "discord.js", inline: true },
             { name: "Node.js",     value: process.version, inline: true },
             { name: "Uptime",      value: formatUptime(Date.now() - startTime), inline: true },
@@ -3086,21 +3476,21 @@ function buildHelpEmbed(permLevel) {
         .setDescription("Use `/` slash commands or the `!` prefix shown below. Items marked with a tier are restricted.")
         .addFields({
             name: "🌐 Public",
-            value: "`/ping` `/stats` `/serverinfo` `/botinfo` `/userinfo` `/avatar` `/roll` `/coinflip` `/rps` `/8ball` `/quote` `/math` `/suggest` `/poll` `/report` `/remindme` `/site` `/discord` `/rank` `/leaderboard` `/ticket` `/snipe` `/help`",
+            value: "`/ping` `/stats` `/serverinfo` `/botinfo` `/userinfo` `/avatar` `/roll` `/coinflip` `/rps` `/8ball` `/quote` `/math` `/suggest` `/poll` `/report` `/remindme` `/site` `/discord` `/rank` `/leaderboard` `/ticket` `/snipe` `/games` `/sharegame` `/aiforget` `/help`",
             inline: false,
         });
 
     if (requireLevel("mod", permLevel)) {
         embed.addFields({
             name: "🛡️ Mod+",
-            value: "`/warn` `/warnings` `/clearwarnings` `/mute` `/unmute` `/purge` `/slowmode` `/lock` `/unlock` `/closeticket` `/setnickname`",
+            value: "`/warn` `/warnings` `/clearwarnings` `/mute` `/unmute` `/purge` `/slowmode` `/lock` `/unlock` `/closeticket` `/setnickname` `/roblox status`",
             inline: false,
         });
     }
     if (requireLevel("admin", permLevel)) {
         embed.addFields({
             name: "👑 Admin+",
-            value: "`/ban` `/kick` `/announce` `/giveaway` `/announcescript` `/generate` `/agent` `/agentclear` `/setwelcome` `/setgoodbyemsg` `/setmodrole` `/setautorole` `/setwelcomechannel` `/setgoodbyechannel` `/setmodlogchannel` `/setticketcategory` `/enableai` `/disableai` `/addcmd` `/removecmd` `/listcmds` `/reactionrole` `/clearxp` `/addgame` `/removegame` `/listgames`",
+            value: "`/ban` `/kick` `/announce` `/giveaway` `/announcescript` `/generate` `/agent` `/agentclear` `/settings` `/ticketpanel` `/roblox setchannel` `/roblox checknow` `/enableai` `/disableai` `/addcmd` `/removecmd` `/listcmds` `/reactionrole` `/clearxp` `/addgame` `/removegame` `/listgames`",
             inline: false,
         });
     }
@@ -3114,6 +3504,136 @@ function buildHelpEmbed(permLevel) {
     embed.setFooter({ text: "Prefix commands mirror most slash commands, e.g. !ping, !help" }).setTimestamp();
     return embed;
 }
+
+// ── Interactive /help: category dropdown so the list isn't one giant wall ────
+const HELP_CATEGORIES = {
+    public: {
+        label: "🌐 Public", minLevel: "member",
+        description: "Fun, info, and utility commands anyone can use",
+        commands: ["/ping", "/stats", "/serverinfo", "/botinfo", "/userinfo", "/avatar", "/roll", "/coinflip", "/rps", "/8ball", "/quote", "/math", "/suggest", "/poll", "/report", "/remindme", "/site", "/discord", "/rank", "/leaderboard", "/snipe"],
+    },
+    tickets: {
+        label: "🎫 Tickets", minLevel: "member",
+        description: "Open and manage support tickets",
+        commands: ["/ticket — open a support ticket", "/closeticket — close the current ticket *(Mod+)*", "/ticketpanel — post an Open Ticket button *(Admin+)*"],
+    },
+    games: {
+        label: "🎮 Game Catalog", minLevel: "member",
+        description: "Browse and share games from the website catalog",
+        commands: ["/games — browse the catalog", "/sharegame — share one game in this channel", "/addgame · /removegame · /listgames *(Admin+)*"],
+    },
+    ai: {
+        label: "🤖 AI", minLevel: "member",
+        description: "Chat with the bot's AI and manage AI memory",
+        commands: ["/aiforget — clear your AI memory here", "/generate · /agent · /agentclear *(Admin+)*", "/enableai · /disableai *(Admin+)*", "/aitest *(Owner)*"],
+    },
+    mod: {
+        label: "🛡️ Moderation", minLevel: "mod",
+        description: "Tools for keeping the server tidy",
+        commands: ["/warn", "/warnings", "/clearwarnings", "/mute", "/unmute", "/purge", "/slowmode", "/lock", "/unlock", "/setnickname"],
+    },
+    settings: {
+        label: "⚙️ Settings & Permissions", minLevel: "admin",
+        description: "Configure the bot for this server",
+        commands: ["/settings view / welcomemessage / goodbyemessage / welcomechannel / goodbyechannel / modlogchannel / autorole / modrole / addmodrole / removemodrole / ticketcategory / ticketlogchannel / ticketnameprefix / robloxchannel / toggle / commandperm / resetcommandperm"],
+    },
+    roblox: {
+        label: "🧩 Roblox Tracker", minLevel: "mod",
+        description: "Track new Roblox Client/Studio versions",
+        commands: ["/roblox status", "/roblox setchannel *(Admin+)*", "/roblox checknow *(Admin+)*"],
+    },
+    admin: {
+        label: "👑 Admin", minLevel: "admin",
+        description: "Server moderation and management",
+        commands: ["/ban", "/kick", "/announce", "/giveaway", "/announcescript", "/addcmd", "/removecmd", "/listcmds", "/reactionrole", "/clearxp"],
+    },
+    owner: {
+        label: "🔑 Owner", minLevel: "owner",
+        description: "Server owner-only tools",
+        commands: ["/command — plain-language control", "/scanandclean", "/testautomod"],
+    },
+};
+
+function buildHelpCategoryEmbed(categoryId, permLevel) {
+    const cat = HELP_CATEGORIES[categoryId] || HELP_CATEGORIES.public;
+    return new EmbedBuilder()
+        .setTitle(`📖 ${cat.label}`)
+        .setColor(0x00FFAA)
+        .setDescription(cat.description)
+        .addFields({ name: "Commands", value: cat.commands.map(c => `• ${c}`).join("\n") || "*Nothing here yet.*" })
+        .setFooter({ text: "Use the menu below to browse other categories • Prefix commands mirror most slash commands" })
+        .setTimestamp();
+}
+
+function buildHelpSelectRow(permLevel, selected = "public") {
+    const menu = new StringSelectMenuBuilder().setCustomId("help_category_select").setPlaceholder("Browse a category…");
+    for (const [id, cat] of Object.entries(HELP_CATEGORIES)) {
+        if (!requireLevel(cat.minLevel, permLevel)) continue;
+        menu.addOptions({ label: cat.label, value: id, description: cat.description.slice(0, 90), default: id === selected });
+    }
+    return new ActionRowBuilder().addComponents(menu);
+}
+
+// ================================================================
+//  GAME CATALOG EMBEDS
+// ================================================================
+function buildGameEmbed(game, sharedBy = null) {
+    return new EmbedBuilder()
+        .setTitle(`🎮 ${game.title}`)
+        .setColor(0x00FFAA)
+        .setDescription(game.description || "*No description yet.*")
+        .setImage(game.image_url || null)
+        .setFooter({ text: sharedBy ? `${SITE_INFO.name} • Shared by ${sharedBy.username}` : SITE_INFO.name })
+        .setTimestamp();
+}
+
+function buildGameButtonsRow(game) {
+    const row = new ActionRowBuilder();
+    if (game.play_url) row.addComponents(new ButtonBuilder().setLabel("▶️ Play Now").setStyle(ButtonStyle.Link).setURL(game.play_url));
+    row.addComponents(new ButtonBuilder().setLabel("🌐 More Games").setStyle(ButtonStyle.Link).setURL(SITE_INFO.url));
+    return row.components.length ? row : null;
+}
+
+function buildGameSelectRow(games, selectedTitle) {
+    const menu = new StringSelectMenuBuilder().setCustomId("games_browse_select").setPlaceholder("Choose a game to view…");
+    for (const g of games.slice(0, 25)) {
+        menu.addOptions({ label: g.title.slice(0, 100), value: g.title.slice(0, 100), default: g.title === selectedTitle });
+    }
+    return new ActionRowBuilder().addComponents(menu);
+}
+
+// ================================================================
+//  SETTINGS EMBED
+// ================================================================
+function buildSettingsEmbed(guild) {
+    const s = getSettings(guild.id);
+    const extra = [...(extraModRoles.get(guild.id) || [])].map(id => `<@&${id}>`).join(", ") || "*None*";
+    const overrides = [...(commandPerms.get(guild.id) || new Map())].map(([cmd, lvl]) => `\`/${cmd}\` → **${lvl}**`).join("\n") || "*None*";
+    return new EmbedBuilder()
+        .setTitle(`⚙️ Settings — ${guild.name}`)
+        .setColor(0x00FFAA)
+        .addFields(
+            { name: "Mod Role",          value: s.modRoleId ? `<@&${s.modRoleId}>` : "*Not set*", inline: true },
+            { name: "Extra Mod Roles",   value: extra, inline: true },
+            { name: "Auto-Role",         value: s.autoRoleId ? `<@&${s.autoRoleId}>` : "*Not set*", inline: true },
+            { name: "Welcome Channel",   value: s.welcomeChannelId ? `<#${s.welcomeChannelId}>` : "*Not set*", inline: true },
+            { name: "Goodbye Channel",   value: s.goodbyeChannelId ? `<#${s.goodbyeChannelId}>` : "*Not set*", inline: true },
+            { name: "Mod-Log Channel",   value: s.modlogChannelId ? `<#${s.modlogChannelId}>` : "*Not set*", inline: true },
+            { name: "Ticket Category",   value: s.ticketCategoryId ? `<#${s.ticketCategoryId}>` : "*Not set*", inline: true },
+            { name: "Ticket Log Channel", value: s.ticketLogChannelId ? `<#${s.ticketLogChannelId}>` : "*Not set*", inline: true },
+            { name: "Ticket Name Prefix", value: `\`${s.ticketNamePrefix || "ticket"}-username\``, inline: true },
+            { name: "Roblox Updates Channel", value: s.robloxUpdatesChannelId ? `<#${s.robloxUpdatesChannelId}>` : "*Not set*", inline: true },
+            { name: "Auto-mod", value: getCfg("automod_enabled", "true") === "true" ? "✅ On" : "❌ Off", inline: true },
+            { name: "XP System", value: getCfg("xp_enabled", "true") === "true" ? "✅ On" : "❌ Off", inline: true },
+            { name: "Welcome Msgs", value: getCfg("welcome_enabled", "true") === "true" ? "✅ On" : "❌ Off", inline: true },
+            { name: "AI (global)", value: getCfg("ai_enabled", "true") === "true" ? "✅ On" : "❌ Off", inline: true },
+            { name: "Command Permission Overrides", value: overrides, inline: false },
+        )
+        .setFooter({ text: "Change any of these with /settings <subcommand>" })
+        .setTimestamp();
+}
+
+
 
 // ================================================================
 //  AI CHAT RESPONSE SENDER
