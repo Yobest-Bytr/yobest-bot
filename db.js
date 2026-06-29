@@ -1,6 +1,6 @@
 "use strict";
 /**
- * db.js — Neon Postgres layer for Yobest_BYTR bot (v2)
+ * db.js — Neon Postgres layer for Yobest_BYTR bot (v3)
  *
  * Degrades gracefully when DATABASE_URL is not set — every function
  * returns a safe empty value instead of throwing.
@@ -8,11 +8,24 @@
 
 let pool = null;
 
+// We set `ssl` explicitly below, so strip any sslmode= query param from the
+// connection string — otherwise pg-connection-string parses it too and logs
+// a noisy "SSL modes are aliases for verify-full" deprecation warning.
+function stripSslMode(connStr) {
+  try {
+    const u = new URL(connStr);
+    u.searchParams.delete("sslmode");
+    return u.toString();
+  } catch {
+    return connStr;
+  }
+}
+
 try {
   if (process.env.DATABASE_URL) {
     const { Pool } = require("pg");
     pool = new Pool({
-      connectionString: process.env.DATABASE_URL,
+      connectionString: stripSslMode(process.env.DATABASE_URL),
       ssl: { rejectUnauthorized: false },
       max: 5,
     });
@@ -81,16 +94,19 @@ async function saveGuildSettings(guildId, s) {
   await q(`INSERT INTO guild_settings
     (guild_id,mod_role_id,auto_role_id,welcome_channel,goodbye_channel,
      modlog_channel,ticket_category,welcome_message,goodbye_message,
-     ticket_log_channel,ticket_panel_channel,ticket_name_prefix,roblox_updates_channel,updated_at)
-   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NOW())
+     ticket_log_channel,ticket_panel_channel,ticket_name_prefix,roblox_updates_channel,
+     game_announce_channel,updated_at)
+   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NOW())
    ON CONFLICT (guild_id) DO UPDATE SET
      mod_role_id=$2,auto_role_id=$3,welcome_channel=$4,goodbye_channel=$5,
      modlog_channel=$6,ticket_category=$7,welcome_message=$8,goodbye_message=$9,
-     ticket_log_channel=$10,ticket_panel_channel=$11,ticket_name_prefix=$12,roblox_updates_channel=$13,updated_at=NOW()`,
+     ticket_log_channel=$10,ticket_panel_channel=$11,ticket_name_prefix=$12,roblox_updates_channel=$13,
+     game_announce_channel=$14,updated_at=NOW()`,
   [guildId,s.modRoleId??null,s.autoRoleId??null,s.welcomeChannelId??null,
    s.goodbyeChannelId??null,s.modlogChannelId??null,s.ticketCategoryId??null,
    s.welcomeMessage??null,s.goodbyeMessage??null,
-   s.ticketLogChannelId??null,s.ticketPanelChannelId??null,s.ticketNamePrefix??null,s.robloxUpdatesChannelId??null]);
+   s.ticketLogChannelId??null,s.ticketPanelChannelId??null,s.ticketNamePrefix??null,s.robloxUpdatesChannelId??null,
+   s.gameAnnounceChannelId??null]);
 }
 
 // ── Mod roles (additional, beyond the single legacy mod_role_id) ──────────────
@@ -177,9 +193,10 @@ async function addGame(title, description, playUrl, imageUrl, addedBy) {
    VALUES ($1,$2,$3,$4,$5,'live')
    ON CONFLICT (title) DO UPDATE SET
      description=$2,play_url=$3,image_url=$4,status='live',added_by=$5
-   RETURNING id`,
+   RETURNING id, (xmax = 0) AS inserted`,
   [title,description??null,playUrl??null,imageUrl??null,addedBy??null]);
-  return rows[0]?.id ?? null;
+  if (!rows[0]) return null;
+  return { id: rows[0].id, isNew: !!rows[0].inserted };
 }
 async function removeGame(title) {
   const { rows } = await q("UPDATE games SET status='hidden' WHERE title=$1 RETURNING id", [title]);
@@ -192,6 +209,13 @@ async function listGames() {
 async function getGame(title) {
   const { rows } = await q("SELECT * FROM games WHERE title=$1", [title]);
   return rows[0] ?? null;
+}
+async function searchGames(query) {
+  const { rows } = await q(
+    "SELECT * FROM games WHERE status='live' AND (title ILIKE $1 OR description ILIKE $1) ORDER BY created_at DESC LIMIT 25",
+    [`%${query}%`]
+  );
+  return rows;
 }
 
 // ── Guild snapshot ─────────────────────────────────────────────────────────────
@@ -249,7 +273,7 @@ module.exports = {
   addReactionRole,
   openTicket, closeTicket,
   saveScript, getScript,
-  addGame, removeGame, listGames, getGame,
+  addGame, removeGame, listGames, getGame, searchGames,
   upsertGuildSnapshot,
   writeHeartbeat,
   getConfig, setConfig, getAllConfig,

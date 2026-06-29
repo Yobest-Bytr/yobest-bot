@@ -1,38 +1,34 @@
 /**
- * Yobest_BYTR Discord Bot  ·  v5.0.0 — SETTINGS, TICKETS, PERMISSIONS, ROBLOX TRACKER
+ * Yobest_BYTR Discord Bot  ·  v5.2.0 — GAME SEARCH + v5.1 FIXES
  * ==========================================================================================
- * WHAT'S NEW IN v5.0.0
+ * WHAT'S NEW IN v5.2.0
  * ------------------------------------------------------------------------------------------
  *
- *  ✨ NEW: /settings — one consolidated command group replaces the old scattered
- *          /setwelcome, /setmodrole, /setticketcategory, etc. Includes /settings view
- *          for an at-a-glance embed of every current setting.
+ *  ✨ NEW: /searchgame <query> — keyword search across the catalog's titles and
+ *          descriptions, for when /games' 25-item dropdown isn't enough to find
+ *          something specific. Same image + Play button display as /games.
  *
- *  ✨ NEW: Ticket system upgrade — /ticketpanel posts a button members can click to
- *          open a ticket in any channel you choose; tickets can use a custom name
- *          prefix (/settings ticketnameprefix); closed tickets are logged to a channel
- *          of your choice (/settings ticketlogchannel).
+ *  🐛 FIX: `games` table on some deployments predated the play_url/image_url/status/
+ *          added_by columns (CREATE TABLE IF NOT EXISTS doesn't alter an existing table).
+ *          schema.sql now ALTERs the table to add anything missing.
+ *  🐛 FIX: Removed the deprecated "ephemeral" boolean across all replies — uses
+ *          MessageFlags.Ephemeral instead (silences the discord.js deprecation warning).
+ *  🐛 FIX: Neon connection string had `sslmode=` stripped before being handed to `pg`,
+ *          since we already set `ssl` explicitly — silences the noisy SSL deprecation
+ *          warning logged on every boot.
  *
- *  ✨ NEW: Granular permissions — admins can add extra moderator roles
- *          (/settings addmodrole) on top of the single legacy mod role, and override
- *          the tier required for any individual command (/settings commandperm).
+ *  ✨ NEW: /addgame is now open to everyone (not just Admins) — but blocks @everyone/
+ *          @here/user/role/channel mentions in any field, rate-limits non-staff to one
+ *          submission every 5 minutes, and won't let someone overwrite another member's
+ *          existing entry.
+ *  ✨ NEW: /announcegame posts a rich announcement (image + Play button) for any
+ *          catalog game to a channel of your choice. New submissions via /addgame also
+ *          auto-announce to /settings gameannouncechannel if one is set.
  *
- *  ✨ NEW: Roblox version tracker (/roblox) — polls Roblox's public client-version
- *          endpoints and posts an announcement to a channel you configure whenever a
- *          new Roblox Client or Roblox Studio version ships.
- *
- *  ✨ NEW: /games and /sharegame — browse the website's game catalog with an
- *          interactive dropdown, or post a rich showcase (image + Play button) for a
- *          single game so members can find it.
- *
- *  ✨ NEW: /help is now interactive — a category dropdown instead of one giant wall
- *          of commands, shown privately (ephemeral) to whoever ran it.
- *
- *  ✨ NEW: AI chat now remembers the last few exchanges per user/channel (clear it
- *          anytime with /aiforget), the system prompt carries richer context, and a
- *          native Discord typing indicator replaces the old "thinking..." message.
- *
- *  ✅ All v4.8 features fully preserved
+ *  ✅ All v5.0 features fully preserved:
+ *  ✨ /settings consolidated config command, /ticketpanel + ticket logging + naming,
+ *     extra mod roles + per-command permission overrides, /roblox version tracker,
+ *     /games browser, interactive /help, AI conversation memory + /aiforget.
  * ==========================================================================================
  */
 
@@ -55,6 +51,7 @@ const {
     ButtonStyle,
     StringSelectMenuBuilder,
     PermissionFlagsBits,
+    MessageFlags,
     REST,
     Routes,
     SlashCommandBuilder,
@@ -121,9 +118,11 @@ const scriptStore        = new Map();   // scriptId → { script, lang, title }
 const extraModRoles      = new Map();   // guildId → Set<roleId> (additional mod roles, beyond modRoleId)
 const commandPerms       = new Map();   // guildId → Map<command, minLevel> (per-command permission overrides)
 const aiChatHistory      = new Map();   // "channelId:userId" → { history: [{role,content}], last: timestamp }
+const gameSubmitCooldown = new Map();   // "guildId:userId" → timestamp of last /addgame submission
 
 const AI_HISTORY_MAX_TURNS = 6;          // remembered exchanges per user/channel
 const AI_HISTORY_IDLE_MS   = 30 * 60_000; // memory resets after 30 min of inactivity
+const GAME_SUBMIT_COOLDOWN_MS = 5 * 60_000; // non-staff can submit one game every 5 min
 const ROBLOX_POLL_INTERVAL_MS = parseInt(process.env.ROBLOX_POLL_INTERVAL_MS) || 10 * 60_000;
 const ROBLOX_VERSION_ENDPOINTS = {
     client: "https://clientsettingscdn.roblox.com/v2/client-version/WindowsPlayer",
@@ -344,6 +343,7 @@ function getSettings(guildId) {
             ticketPanelChannelId:   null,
             ticketNamePrefix:       "ticket",
             robloxUpdatesChannelId: null,
+            gameAnnounceChannelId:  null,
         };
         guildSettings.set(guildId, wrapSettings(guildId, obj));
     }
@@ -459,6 +459,14 @@ function sanitizeChannelName(raw) {
     name = name.replace(/[A-Z]/g, (c) => c.toLowerCase());
     if (name.length > 100) name = name.slice(0, 100);
     return name || "new-channel";
+}
+
+// Detects @everyone/@here, <@user>, <@&role>, and <#channel> mention syntax in
+// free-text user submissions (e.g. /addgame fields) so they can't be used to
+// ping people once the text is later posted in an announcement/share embed.
+function containsMentionSyntax(text) {
+    if (!text) return false;
+    return /@everyone|@here|<@!?\d+>|<@&\d+>|<#\d+>/.test(text);
 }
 
 function buildPermissionOverwriteObject(allowList = [], denyList = []) {
@@ -654,6 +662,8 @@ const slashCommands = [
             .addStringOption(o => o.setName("prefix").setDescription("e.g. \"ticket\" → #ticket-username").setRequired(true)))
         .addSubcommand(sc => sc.setName("robloxchannel").setDescription("Set the channel for Roblox/Roblox Studio version update announcements")
             .addChannelOption(o => o.setName("channel").setDescription("Roblox updates channel").setRequired(true).addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)))
+        .addSubcommand(sc => sc.setName("gameannouncechannel").setDescription("Set the channel new game catalog submissions are auto-announced to")
+            .addChannelOption(o => o.setName("channel").setDescription("Game announcements channel").setRequired(true).addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)))
         .addSubcommand(sc => sc.setName("toggle").setDescription("Turn a bot feature on or off")
             .addStringOption(o => o.setName("feature").setDescription("Feature to toggle").setRequired(true)
                 .addChoices({ name: "Auto-mod", value: "automod_enabled" }, { name: "XP system", value: "xp_enabled" }, { name: "Welcome messages", value: "welcome_enabled" }, { name: "AI (global)", value: "ai_enabled" }))
@@ -712,7 +722,14 @@ const slashCommands = [
         .setName("sharegame").setDescription("Share a game from the catalog with everyone in this channel")
         .addStringOption(o => o.setName("title").setDescription("Game title").setRequired(true).setAutocomplete(true)),
     new SlashCommandBuilder()
+        .setName("announcegame").setDescription("[Admin] Post a game announcement to a channel")
+        .addStringOption(o => o.setName("title").setDescription("Game title").setRequired(true).setAutocomplete(true))
+        .addChannelOption(o => o.setName("channel").setDescription("Defaults to this channel").addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)),
+    new SlashCommandBuilder()
         .setName("games").setDescription("Browse the game catalog"),
+    new SlashCommandBuilder()
+        .setName("searchgame").setDescription("Search the game catalog by title or keyword")
+        .addStringOption(o => o.setName("query").setDescription("e.g. \"obby\", \"simulator\", a word from the title").setRequired(true)),
 
     // AI
     new SlashCommandBuilder().setName("aiforget").setDescription("Clear your AI chat memory in this channel"),
@@ -743,8 +760,8 @@ async function registerSlashCommands() {
 
 // ====================== READY ======================
 client.once("clientReady", async () => {
-    console.log(`✅ Yobest_BYTR Bot v5.0 Online — ${client.user.tag}`);
-    client.user.setActivity("🛡️ Protecting the server | v5.0", { type: 3 });
+    console.log(`✅ Yobest_BYTR Bot v5.2 Online — ${client.user.tag}`);
+    client.user.setActivity("🛡️ Protecting the server | v5.2", { type: 3 });
 
     // ── Neon: init schema + hydrate all in-memory state ───────────────────────
     await db.initSchema();
@@ -765,6 +782,7 @@ client.once("clientReady", async () => {
             ticketPanelChannelId:   row.ticket_panel_channel || null,
             ticketNamePrefix:       row.ticket_name_prefix   || "ticket",
             robloxUpdatesChannelId: row.roblox_updates_channel || null,
+            gameAnnounceChannelId:  row.game_announce_channel || null,
         };
         guildSettings.set(row.guild_id, wrapSettings(row.guild_id, obj));
     }
@@ -893,9 +911,9 @@ async function runStartupSelfTest() {
         }
         if (!ch) return;
         const embed = new EmbedBuilder()
-            .setTitle("✅ Yobest Bot v5.0 — Online")
+            .setTitle("✅ Yobest Bot v5.2 — Online")
             .setColor(0x00FFAA)
-            .setDescription("v5.0 — Settings console, ticket panels + logging, granular permissions, Roblox version tracker, smarter AI memory, game catalog browser.")
+            .setDescription("v5.2 — Game search, open submissions + auto-announcements, settings console, ticket panels + logging, granular permissions, Roblox version tracker, smarter AI memory.")
             .addFields(
                 { name: "🛡️ Auto-Mod",        value: "✅ Instant regex + AI vision", inline: false },
                 { name: "🤬 Profanity",        value: `✅ ${PROFANITY_PATTERNS.length} patterns`, inline: true },
@@ -909,7 +927,7 @@ async function runStartupSelfTest() {
                 { name: "🧩 Roblox Tracker",   value: `✅ polling every ${Math.round(ROBLOX_POLL_INTERVAL_MS/60000)}m`, inline: true },
                 { name: "🧠 AI Model",         value: OPENROUTER_MODEL, inline: false },
             )
-            .setFooter({ text: "Yobest_BYTR Bot v5.0" })
+            .setFooter({ text: "Yobest_BYTR Bot v5.2" })
             .setTimestamp();
         await ch.send({ embeds: [embed] });
     } catch (e) { console.error("Startup self-test error:", e); }
@@ -1018,7 +1036,7 @@ client.on("interactionCreate", async (interaction) => {
 
     const reply = async (opts, ephemeral = false) => {
         if (typeof opts === "string") opts = { content: opts };
-        opts.ephemeral = ephemeral;
+        if (ephemeral) opts.flags = MessageFlags.Ephemeral;
         if (interaction.deferred || interaction.replied) return interaction.editReply(opts);
         return interaction.reply(opts);
     };
@@ -1247,7 +1265,7 @@ client.on("interactionCreate", async (interaction) => {
         // ---- SCRIPT ANNOUNCER ----
         if (commandName === "announcescript") {
             if (!checkPerm(commandName, "admin", permLevel, guild.id)) return replyErr("You need Admin or higher.");
-            await interaction.deferReply({ ephemeral: true });
+            await interaction.deferReply({ flags: MessageFlags.Ephemeral });
             const title     = interaction.options.getString("title");
             const desc      = interaction.options.getString("desc");
             const scriptStr = interaction.options.getString("script");
@@ -1322,7 +1340,7 @@ client.on("interactionCreate", async (interaction) => {
         }
         if (commandName === "purge") {
             if (!checkPerm(commandName, "mod", permLevel, guild.id)) return replyErr("You need Mod or higher.");
-            await interaction.deferReply({ ephemeral: true });
+            await interaction.deferReply({ flags: MessageFlags.Ephemeral });
             const n       = interaction.options.getInteger("count");
             const deleted = await interaction.channel.bulkDelete(n, true);
             return reply(`🗑️ Deleted **${deleted.size}** messages.`);
@@ -1380,7 +1398,7 @@ client.on("interactionCreate", async (interaction) => {
         }
         if (commandName === "announce") {
             if (!checkPerm(commandName, "admin", permLevel, guild.id)) return replyErr("You need Admin or higher.");
-            await interaction.deferReply({ ephemeral: true });
+            await interaction.deferReply({ flags: MessageFlags.Ephemeral });
             const title       = interaction.options.getString("title");
             const description = interaction.options.getString("desc");
             const ytId        = interaction.options.getString("video") ? extractYouTubeId(interaction.options.getString("video")) : null;
@@ -1436,6 +1454,7 @@ client.on("interactionCreate", async (interaction) => {
                 return reply(`✅ New tickets will be named like \`#${prefix}-username\`.`);
             }
             if (sub === "robloxchannel") { const c = interaction.options.getChannel("channel"); s.robloxUpdatesChannelId = c.id; return reply(`✅ Roblox version updates will post in ${c}.`); }
+            if (sub === "gameannouncechannel") { const c = interaction.options.getChannel("channel"); s.gameAnnounceChannelId = c.id; return reply(`✅ New game catalog submissions will be announced in ${c}.`); }
             if (sub === "toggle") {
                 const feature = interaction.options.getString("feature");
                 const value   = interaction.options.getString("value");
@@ -1541,14 +1560,66 @@ client.on("interactionCreate", async (interaction) => {
 
         // ---- GAME CATALOG ----
         if (commandName === "addgame") {
-            if (!checkPerm(commandName, "admin", permLevel, guild.id)) return replyErr("You need Admin or higher.");
+            if (!checkPerm(commandName, "member", permLevel, guild.id)) return replyErr("You don't have permission to use this.");
             if (!db.ready()) return replyErr("Database not configured — set `DATABASE_URL` to enable the game catalog.");
             const title = interaction.options.getString("title");
             const desc  = interaction.options.getString("description");
             const link  = interaction.options.getString("link");
             const image = interaction.options.getString("image");
-            await db.addGame(title, desc, link, image, member.user.tag);
-            return reply(`✅ **${title}** added to the website games page.`);
+
+            for (const [field, val] of [["title", title], ["description", desc], ["link", link]]) {
+                if (val && containsMentionSyntax(val)) return replyErr(`Mentions (@everyone, @user, #channel, etc.) aren't allowed in the **${field}** field.`);
+            }
+
+            // Non-staff: rate-limit + block hijacking someone else's existing entry
+            if (!requireLevel("mod", permLevel)) {
+                const cooldownKey = `${guild.id}:${member.id}`;
+                const last = gameSubmitCooldown.get(cooldownKey) || 0;
+                const remaining = GAME_SUBMIT_COOLDOWN_MS - (Date.now() - last);
+                if (remaining > 0) return replyErr(`Slow down! You can add another game in ${Math.ceil(remaining / 60000)} min.`);
+                const existing = await db.getGame(title);
+                if (existing && existing.added_by !== member.user.tag) return replyErr(`A game named **${title}** already exists. Pick a different title, or ask a mod to edit it.`);
+                gameSubmitCooldown.set(cooldownKey, Date.now());
+            }
+
+            const result = await db.addGame(title, desc, link, image, member.user.tag);
+            if (!result) return replyErr("Could not save that game — please try again.");
+            await reply(`✅ **${title}** added to the website games page.`);
+
+            // Auto-announce brand-new games (not edits) if a channel is configured
+            if (result.isNew) {
+                const announceChannelId = getSettings(guild.id).gameAnnounceChannelId;
+                const announceCh = announceChannelId ? guild.channels.cache.get(announceChannelId) : null;
+                if (announceCh?.send) {
+                    const game = await db.getGame(title);
+                    if (game) {
+                        const row = buildGameButtonsRow(game);
+                        await announceCh.send({
+                            content: `🆕 **${member.user.username}** added a new game to the catalog!`,
+                            embeds: [buildGameEmbed(game, member.user)],
+                            components: row ? [row] : [],
+                            allowedMentions: { parse: [] },
+                        }).catch(() => {});
+                    }
+                }
+            }
+            return;
+        }
+        if (commandName === "announcegame") {
+            if (!checkPerm(commandName, "admin", permLevel, guild.id)) return replyErr("You need Admin or higher.");
+            if (!db.ready()) return replyErr("Database not configured — set `DATABASE_URL` to enable the game catalog.");
+            const title   = interaction.options.getString("title");
+            const channel = interaction.options.getChannel("channel") || interaction.channel;
+            const game    = await db.getGame(title);
+            if (!game || game.status !== "live") return replyErr(`No live game found matching **${title}**. Use \`/games\` to browse the catalog.`);
+            const row = buildGameButtonsRow(game);
+            await channel.send({
+                content:    `📢 **New on ${SITE_INFO.name}!**`,
+                embeds:     [buildGameEmbed(game)],
+                components: row ? [row] : [],
+                allowedMentions: { parse: [] },
+            });
+            return reply(`✅ Announced **${title}** in ${channel}.`);
         }
         if (commandName === "removegame") {
             if (!checkPerm(commandName, "admin", permLevel, guild.id)) return replyErr("You need Admin or higher.");
@@ -1587,6 +1658,18 @@ client.on("interactionCreate", async (interaction) => {
             if (btnRow) components.push(btnRow);
             return reply({ embeds: [buildGameEmbed(game)], components }, true);
         }
+        if (commandName === "searchgame") {
+            if (!db.ready()) return replyErr("Database not configured — set `DATABASE_URL` to enable the game catalog.");
+            const query   = interaction.options.getString("query");
+            const matches = await db.searchGames(query);
+            if (!matches.length) return reply(`🔍 No games found matching **${query}**. Try \`/games\` to browse the full catalog.`, true);
+            const game        = matches[0];
+            const components  = [buildGameSelectRow(matches, game.title, `games_search_select:${query.slice(0, 70)}`)];
+            const btnRow      = buildGameButtonsRow(game);
+            if (btnRow) components.push(btnRow);
+            const note = matches.length === 25 ? "\n*Showing the first 25 matches — refine your search for more specific results.*" : "";
+            return reply({ content: `🔍 Found **${matches.length}** match${matches.length === 1 ? "" : "es"} for **${query}**.${note}`, embeds: [buildGameEmbed(game)], components }, true);
+        }
         if (commandName === "aiforget") {
             aiChatHistory.delete(`${interaction.channelId}:${member.id}`);
             return reply("🧹 Cleared your AI chat memory in this channel.", true);
@@ -1601,7 +1684,7 @@ client.on("interactionCreate", async (interaction) => {
         }
         if (commandName === "testautomod") {
             if (guild.ownerId !== member.id) return replyErr("Owner only.");
-            await interaction.deferReply({ ephemeral: true });
+            await interaction.deferReply({ flags: MessageFlags.Ephemeral });
             const tests = [
                 { text: "sex",                                               expect: "profanity" },
                 { text: "I am giving away $2500 to everyone who registers!", expect: "scam phrase" },
@@ -1630,7 +1713,7 @@ client.on("interactionCreate", async (interaction) => {
         const msg = `❌ Error: ${e.message}`;
         try {
             if (interaction.deferred || interaction.replied) await interaction.editReply(msg);
-            else await interaction.reply({ content: msg, ephemeral: true });
+            else await interaction.reply({ content: msg, flags: MessageFlags.Ephemeral });
         } catch {}
     }
 });
@@ -1645,8 +1728,8 @@ async function handleButtonInteraction(interaction) {
     if (id.startsWith("build_confirm_") || id.startsWith("build_cancel_")) {
         const iid     = id.replace("build_confirm_", "").replace("build_cancel_", "");
         const pending = pendingBuilds.get(iid);
-        if (!pending) return interaction.reply({ content: "❌ Build request expired (5 min). Run `/generate` again.", ephemeral: true });
-        if (interaction.user.id !== pending.userId) return interaction.reply({ content: "❌ Only the person who ran /generate can confirm this.", ephemeral: true });
+        if (!pending) return interaction.reply({ content: "❌ Build request expired (5 min). Run `/generate` again.", flags: MessageFlags.Ephemeral });
+        if (interaction.user.id !== pending.userId) return interaction.reply({ content: "❌ Only the person who ran /generate can confirm this.", flags: MessageFlags.Ephemeral });
         if (id.startsWith("build_cancel_")) {
             pendingBuilds.delete(iid);
             return interaction.update({ content: "❌ Server build cancelled.", embeds: [], components: [] });
@@ -1670,8 +1753,8 @@ async function handleButtonInteraction(interaction) {
     if (id.startsWith("agent_confirm_") || id.startsWith("agent_cancel_")) {
         const token   = id.replace("agent_confirm_", "").replace("agent_cancel_", "");
         const pending = pendingAgentActions.get(token);
-        if (!pending) return interaction.reply({ content: "❌ Confirmation expired. Re-run `/agent`.", ephemeral: true });
-        if (interaction.user.id !== pending.userId) return interaction.reply({ content: "❌ Only the person who ran /agent can confirm this.", ephemeral: true });
+        if (!pending) return interaction.reply({ content: "❌ Confirmation expired. Re-run `/agent`.", flags: MessageFlags.Ephemeral });
+        if (interaction.user.id !== pending.userId) return interaction.reply({ content: "❌ Only the person who ran /agent can confirm this.", flags: MessageFlags.Ephemeral });
         if (id.startsWith("agent_cancel_")) {
             pendingAgentActions.delete(token);
             return interaction.update({ content: "❌ Destructive actions cancelled.", embeds: interaction.message.embeds, components: [] });
@@ -1688,8 +1771,8 @@ async function handleButtonInteraction(interaction) {
     if (id.startsWith("owner_confirm_") || id.startsWith("owner_cancel_")) {
         const token   = id.replace("owner_confirm_", "").replace("owner_cancel_", "");
         const pending = pendingOwnerActions.get(token);
-        if (!pending) return interaction.reply({ content: "❌ Confirmation expired. Re-run `/command`.", ephemeral: true });
-        if (interaction.user.id !== pending.userId) return interaction.reply({ content: "❌ Only the server owner can confirm this.", ephemeral: true });
+        if (!pending) return interaction.reply({ content: "❌ Confirmation expired. Re-run `/command`.", flags: MessageFlags.Ephemeral });
+        if (interaction.user.id !== pending.userId) return interaction.reply({ content: "❌ Only the server owner can confirm this.", flags: MessageFlags.Ephemeral });
         if (id.startsWith("owner_cancel_")) {
             pendingOwnerActions.delete(token);
             return interaction.update({ content: "❌ Action cancelled.", embeds: interaction.message.embeds, components: [] });
@@ -1708,36 +1791,36 @@ async function handleButtonInteraction(interaction) {
     if (id.startsWith("script_view_")) {
         const scriptId_v = id.replace("script_view_", "");
         const data = scriptStore.get(scriptId_v) || await db.getScript(scriptId_v);
-        if (!data) return interaction.reply({ content: "❌ Script data not found — use the download attachment on the announcement post instead).", ephemeral: true });
+        if (!data) return interaction.reply({ content: "❌ Script data not found — use the download attachment on the announcement post instead).", flags: MessageFlags.Ephemeral });
         const chunks = splitCode(data.script, 1900);
-        await interaction.reply({ content: `📜 **Full Script** (${chunks.length} part${chunks.length > 1 ? "s" : ""}):\n\`\`\`${data.lang}\n${chunks[0]}\n\`\`\``, ephemeral: true });
+        await interaction.reply({ content: `📜 **Full Script** (${chunks.length} part${chunks.length > 1 ? "s" : ""}):\n\`\`\`${data.lang}\n${chunks[0]}\n\`\`\``, flags: MessageFlags.Ephemeral });
         for (let i = 1; i < chunks.length; i++)
-            await interaction.followUp({ content: `\`\`\`${data.lang}\n${chunks[i]}\n\`\`\``, ephemeral: true });
+            await interaction.followUp({ content: `\`\`\`${data.lang}\n${chunks[i]}\n\`\`\``, flags: MessageFlags.Ephemeral });
         return;
     }
 
     if (id.startsWith("script_copy_")) {
         const scriptId_c = id.replace("script_copy_", "");
         const data = scriptStore.get(scriptId_c) || await db.getScript(scriptId_c);
-        if (!data) return interaction.reply({ content: "❌ Script data not found.", ephemeral: true });
+        if (!data) return interaction.reply({ content: "❌ Script data not found.", flags: MessageFlags.Ephemeral });
         const preview = data.script.slice(0, 1800);
         return interaction.reply({
             content: `📋 **Copy the script below** (Ctrl+A → Ctrl+C):\n\`\`\`${data.lang}\n${preview}${data.script.length > 1800 ? "\n...(use 👁️ View Full or ⬇️ Download for the complete script)" : ""}\n\`\`\``,
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
         });
     }
 
     if (id.startsWith("script_download_")) {
         const scriptId_d = id.replace("script_download_", "");
         const data = scriptStore.get(scriptId_d) || await db.getScript(scriptId_d);
-        if (!data) return interaction.reply({ content: "❌ Script not found — use the file attachment on the original announcement post instead.", ephemeral: true });
+        if (!data) return interaction.reply({ content: "❌ Script not found — use the file attachment on the original announcement post instead.", flags: MessageFlags.Ephemeral });
         const extMap   = { javascript: "js", python: "py", typescript: "ts", txt: "txt" };
         const ext      = extMap[data.lang] || "lua";
         const filename = `${data.title.replace(/[^a-zA-Z0-9_\-]/g, "_").slice(0, 40)}.${ext}`;
         return interaction.reply({
             content: `⬇️ **Download: \`${filename}\`**`,
             files:   [new AttachmentBuilder(Buffer.from(data.script, "utf8"), { name: filename })],
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
         });
     }
 
@@ -1745,22 +1828,22 @@ async function handleButtonInteraction(interaction) {
         const existing = [...interaction.guild.channels.cache.values()].find(
             c => ticketChannels.has(c.id) && c.topic?.includes(`(${interaction.user.id})`)
         );
-        if (existing) return interaction.reply({ content: `❌ You already have an open ticket: ${existing}`, ephemeral: true });
+        if (existing) return interaction.reply({ content: `❌ You already have an open ticket: ${existing}`, flags: MessageFlags.Ephemeral });
         try {
             const ch = await createTicketChannel(interaction.guild, interaction.member);
-            return interaction.reply({ content: `✅ Ticket created: ${ch}`, ephemeral: true });
+            return interaction.reply({ content: `✅ Ticket created: ${ch}`, flags: MessageFlags.Ephemeral });
         } catch (e) {
-            return interaction.reply({ content: `❌ Could not create ticket: ${e.message}`, ephemeral: true });
+            return interaction.reply({ content: `❌ Could not create ticket: ${e.message}`, flags: MessageFlags.Ephemeral });
         }
     }
 
     if (id === "ticket_close_btn") {
         const permLevel = getPermLevel(interaction.member, interaction.guild);
         if (!requireLevel("mod", permLevel)) {
-            return interaction.reply({ content: "❌ Only mods+ can close this ticket.", ephemeral: true });
+            return interaction.reply({ content: "❌ Only mods+ can close this ticket.", flags: MessageFlags.Ephemeral });
         }
         if (!ticketChannels.has(interaction.channelId)) {
-            return interaction.reply({ content: "❌ Not a ticket channel.", ephemeral: true });
+            return interaction.reply({ content: "❌ Not a ticket channel.", flags: MessageFlags.Ephemeral });
         }
         await interaction.reply("🔒 Closing ticket in 3 seconds...");
         await closeTicketChannel(interaction.channel, interaction.user.tag);
@@ -1801,7 +1884,7 @@ async function closeTicketChannel(channel, closedByTag) {
 // ================================================================
 async function handleAutocomplete(interaction) {
     try {
-        if (!["sharegame", "removegame"].includes(interaction.commandName)) return interaction.respond([]);
+        if (!["sharegame", "removegame", "announcegame"].includes(interaction.commandName)) return interaction.respond([]);
         if (!db.ready()) return interaction.respond([]);
         const focused = (interaction.options.getFocused() || "").toLowerCase();
         const games   = await db.listGames();
@@ -1839,9 +1922,20 @@ async function handleSelectMenuInteraction(interaction) {
             if (btnRow) components.push(btnRow);
             return interaction.update({ embeds: [buildGameEmbed(game)], components });
         }
+        if (interaction.customId.startsWith("games_search_select:")) {
+            const query = interaction.customId.slice("games_search_select:".length);
+            const title = interaction.values[0];
+            const game  = await db.getGame(title);
+            if (!game) return interaction.update({ content: "❌ That game is no longer available.", embeds: [], components: [] });
+            const matches     = await db.searchGames(query);
+            const components  = [buildGameSelectRow(matches.length ? matches : [game], title, interaction.customId)];
+            const btnRow      = buildGameButtonsRow(game);
+            if (btnRow) components.push(btnRow);
+            return interaction.update({ embeds: [buildGameEmbed(game)], components });
+        }
     } catch (e) {
         console.error("[selectmenu]", e.message);
-        try { await interaction.reply({ content: `❌ Error: ${e.message}`, ephemeral: true }); } catch {}
+        try { await interaction.reply({ content: `❌ Error: ${e.message}`, flags: MessageFlags.Ephemeral }); } catch {}
     }
 }
 
@@ -3350,7 +3444,7 @@ function buildStatsEmbed(guild) {
             { name: "💾 Memory",      value: `${(mem.heapUsed / 1024 / 1024).toFixed(1)} MB`, inline: true },
             { name: "🌐 Servers",     value: `${client.guilds.cache.size}`, inline: true },
             { name: "👥 Members",     value: `${guild?.memberCount ?? "?"}`, inline: true },
-            { name: "📦 Version",     value: "v5.0", inline: true },
+            { name: "📦 Version",     value: "v5.2", inline: true },
         )
         .setFooter({ text: `${SITE_INFO.name}` })
         .setTimestamp();
@@ -3362,7 +3456,7 @@ function buildBotInfoEmbed() {
         .setColor(0x00FFAA)
         .setThumbnail(client.user.displayAvatarURL({ dynamic: true }))
         .addFields(
-            { name: "Version",     value: "v5.0", inline: true },
+            { name: "Version",     value: "v5.2", inline: true },
             { name: "Library",     value: "discord.js", inline: true },
             { name: "Node.js",     value: process.version, inline: true },
             { name: "Uptime",      value: formatUptime(Date.now() - startTime), inline: true },
@@ -3476,7 +3570,7 @@ function buildHelpEmbed(permLevel) {
         .setDescription("Use `/` slash commands or the `!` prefix shown below. Items marked with a tier are restricted.")
         .addFields({
             name: "🌐 Public",
-            value: "`/ping` `/stats` `/serverinfo` `/botinfo` `/userinfo` `/avatar` `/roll` `/coinflip` `/rps` `/8ball` `/quote` `/math` `/suggest` `/poll` `/report` `/remindme` `/site` `/discord` `/rank` `/leaderboard` `/ticket` `/snipe` `/games` `/sharegame` `/aiforget` `/help`",
+            value: "`/ping` `/stats` `/serverinfo` `/botinfo` `/userinfo` `/avatar` `/roll` `/coinflip` `/rps` `/8ball` `/quote` `/math` `/suggest` `/poll` `/report` `/remindme` `/site` `/discord` `/rank` `/leaderboard` `/ticket` `/snipe` `/games` `/searchgame` `/sharegame` `/addgame` `/aiforget` `/help`",
             inline: false,
         });
 
@@ -3490,7 +3584,7 @@ function buildHelpEmbed(permLevel) {
     if (requireLevel("admin", permLevel)) {
         embed.addFields({
             name: "👑 Admin+",
-            value: "`/ban` `/kick` `/announce` `/giveaway` `/announcescript` `/generate` `/agent` `/agentclear` `/settings` `/ticketpanel` `/roblox setchannel` `/roblox checknow` `/enableai` `/disableai` `/addcmd` `/removecmd` `/listcmds` `/reactionrole` `/clearxp` `/addgame` `/removegame` `/listgames`",
+            value: "`/ban` `/kick` `/announce` `/giveaway` `/announcescript` `/announcegame` `/generate` `/agent` `/agentclear` `/settings` `/ticketpanel` `/roblox setchannel` `/roblox checknow` `/enableai` `/disableai` `/addcmd` `/removecmd` `/listcmds` `/reactionrole` `/clearxp` `/removegame` `/listgames`",
             inline: false,
         });
     }
@@ -3519,8 +3613,8 @@ const HELP_CATEGORIES = {
     },
     games: {
         label: "🎮 Game Catalog", minLevel: "member",
-        description: "Browse and share games from the website catalog",
-        commands: ["/games — browse the catalog", "/sharegame — share one game in this channel", "/addgame · /removegame · /listgames *(Admin+)*"],
+        description: "Browse, share, and submit games to the website catalog",
+        commands: ["/games — browse the catalog", "/searchgame — search by title or keyword", "/sharegame — share one game in this channel", "/addgame — submit a game (everyone, no mentions, 1 every 5 min)", "/announcegame · /removegame · /listgames *(Admin+)*"],
     },
     ai: {
         label: "🤖 AI", minLevel: "member",
@@ -3535,7 +3629,7 @@ const HELP_CATEGORIES = {
     settings: {
         label: "⚙️ Settings & Permissions", minLevel: "admin",
         description: "Configure the bot for this server",
-        commands: ["/settings view / welcomemessage / goodbyemessage / welcomechannel / goodbyechannel / modlogchannel / autorole / modrole / addmodrole / removemodrole / ticketcategory / ticketlogchannel / ticketnameprefix / robloxchannel / toggle / commandperm / resetcommandperm"],
+        commands: ["/settings view / welcomemessage / goodbyemessage / welcomechannel / goodbyechannel / modlogchannel / autorole / modrole / addmodrole / removemodrole / ticketcategory / ticketlogchannel / ticketnameprefix / robloxchannel / gameannouncechannel / toggle / commandperm / resetcommandperm"],
     },
     roblox: {
         label: "🧩 Roblox Tracker", minLevel: "mod",
@@ -3594,8 +3688,8 @@ function buildGameButtonsRow(game) {
     return row.components.length ? row : null;
 }
 
-function buildGameSelectRow(games, selectedTitle) {
-    const menu = new StringSelectMenuBuilder().setCustomId("games_browse_select").setPlaceholder("Choose a game to view…");
+function buildGameSelectRow(games, selectedTitle, customId = "games_browse_select") {
+    const menu = new StringSelectMenuBuilder().setCustomId(customId).setPlaceholder("Choose a game to view…");
     for (const g of games.slice(0, 25)) {
         menu.addOptions({ label: g.title.slice(0, 100), value: g.title.slice(0, 100), default: g.title === selectedTitle });
     }
@@ -3623,6 +3717,7 @@ function buildSettingsEmbed(guild) {
             { name: "Ticket Log Channel", value: s.ticketLogChannelId ? `<#${s.ticketLogChannelId}>` : "*Not set*", inline: true },
             { name: "Ticket Name Prefix", value: `\`${s.ticketNamePrefix || "ticket"}-username\``, inline: true },
             { name: "Roblox Updates Channel", value: s.robloxUpdatesChannelId ? `<#${s.robloxUpdatesChannelId}>` : "*Not set*", inline: true },
+            { name: "Game Announce Channel", value: s.gameAnnounceChannelId ? `<#${s.gameAnnounceChannelId}>` : "*Not set*", inline: true },
             { name: "Auto-mod", value: getCfg("automod_enabled", "true") === "true" ? "✅ On" : "❌ Off", inline: true },
             { name: "XP System", value: getCfg("xp_enabled", "true") === "true" ? "✅ On" : "❌ Off", inline: true },
             { name: "Welcome Msgs", value: getCfg("welcome_enabled", "true") === "true" ? "✅ On" : "❌ Off", inline: true },
